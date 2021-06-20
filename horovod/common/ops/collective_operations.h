@@ -45,6 +45,8 @@ public:
 protected:
   int64_t NumElements(std::vector<TensorTableEntry>& entries);
 
+  virtual void WaitForData(std::vector<TensorTableEntry>& entries);
+
   HorovodGlobalState* global_state_;
 };
 

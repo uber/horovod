@@ -223,6 +223,8 @@ void CCLAllreduce::ScaleBuffer(double scale_factor,
 
 Status CCLAllreduce::Execute(std::vector<TensorTableEntry>& entries,
                              const Response& response) {
+  WaitForData(entries);
+
   auto& first_entry = entries[0];
   LOG(DEBUG) << "CCLAllreduce::Execute #entries: " << entries.size()
              << " device " << first_entry.device;
@@ -340,6 +342,8 @@ void CCLAllgather::MemcpyEntryOutFusionBuffer(
 
 Status CCLAllgather::Execute(std::vector<TensorTableEntry>& entries,
                              const Response& response) {
+  WaitForData(entries);
+
   auto& first_entry = entries[0];
   LOG(DEBUG) << "CCLAllgather::Execute #entries: " << entries.size()
              << " device " << first_entry.device;
@@ -448,6 +452,8 @@ Status CCLAllgather::Execute(std::vector<TensorTableEntry>& entries,
 
 Status CCLBroadcast::Execute(std::vector<TensorTableEntry>& entries,
                              const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto& e = entries[0];
   LOG(DEBUG) << "CCLBroadcast::Execute #entries: " << entries.size()
@@ -479,6 +485,8 @@ Status CCLBroadcast::Execute(std::vector<TensorTableEntry>& entries,
 
 Status CCLAlltoall::Execute(std::vector<TensorTableEntry>& entries,
                             const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto e = entries[0];
   LOG(DEBUG) << "CCLAlltoall::Execute #entries: " << entries.size()

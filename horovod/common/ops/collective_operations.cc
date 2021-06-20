@@ -32,6 +32,35 @@ int64_t HorovodOp::NumElements(std::vector<TensorTableEntry>& entries) {
   return num_elements;
 }
 
+void HorovodOp::WaitForData(std::vector<TensorTableEntry>& entries) {
+  // On GPU data readiness is signalled by ready_event.
+  auto& timeline = global_state_->timeline;
+  std::vector<TensorTableEntry> waiting_tensors;
+  for (auto& e : entries) {
+    if (e.ready_event_list.size() != 0) {
+      timeline.ActivityStart(e.tensor_name, WAIT_FOR_DATA);
+      waiting_tensors.push_back(e);
+    }
+  }
+  while (!waiting_tensors.empty()) {
+    for (auto it = waiting_tensors.begin(); it != waiting_tensors.end();) {
+      if (it->ready_event_list.Ready()) {
+        timeline.ActivityEnd(it->tensor_name);
+        timeline.ActivityStart(it->tensor_name, WAIT_FOR_OTHER_TENSOR_DATA);
+        it = waiting_tensors.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+  }
+  for (auto& e : entries) {
+    if (e.ready_event_list.size() != 0) {
+      timeline.ActivityEnd(e.tensor_name);
+    }
+  }
+}
+
 // Allreduce
 AllreduceOp::AllreduceOp(HorovodGlobalState* global_state)
     : HorovodOp(global_state) {}
@@ -261,6 +290,8 @@ JoinOp::JoinOp(HorovodGlobalState* global_state) : HorovodOp(global_state) {}
 
 Status JoinOp::Execute(std::vector<TensorTableEntry>& entries,
                        const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 0);
   if (global_state_->joined) {
     global_state_->tensor_queue.RemoveJoinTensor();

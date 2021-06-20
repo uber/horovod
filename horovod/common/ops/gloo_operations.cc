@@ -118,6 +118,7 @@ GlooAllreduce::GlooAllreduce(GlooContext* gloo_context,
 
 Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
+  WaitForData(entries);
   auto& first_entry = entries[0];
 
   const void* fused_input_data;
@@ -183,6 +184,8 @@ bool GlooAllgather::Enabled(const ParameterManager& param_manager,
 
 Status GlooAllgather::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
+  WaitForData(entries);
+
   auto& timeline = global_state_->timeline;
 
   // Sizes of subcomponents of each entry from all ranks
@@ -278,6 +281,8 @@ GlooBroadcast::GlooBroadcast(GlooContext* gloo_context,
 
 Status GlooBroadcast::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto e = entries[0];
 
@@ -312,6 +317,8 @@ GlooAlltoall::GlooAlltoall(GlooContext* gloo_context,
     : AlltoallOp(global_state), gloo_context_(gloo_context) {}
 
 Status GlooAlltoall::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto e = entries[0];
 

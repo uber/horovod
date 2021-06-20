@@ -123,6 +123,22 @@ void NCCLOpContext::PopulateNCCLCommStrategy(int& nccl_rank, int& nccl_size,
   nccl_id_bcast_comm = communicator_type_;
 }
 
+void NCCLAllreduce::WaitForData(std::vector<TensorTableEntry>& entries) {
+  if (global_state_->timeline.Initialized()) {
+    // If timeline is initialized, need to use normal CPU syncing path
+    HorovodOp::WaitForData(entries);
+  } else {
+    // Push events to set to deduplicate entries
+    std::unordered_set<gpuEvent_t> event_set;
+    for (auto& e : entries) {
+      e.ready_event_list.PushEventsToSet(event_set);
+    }
+    for (auto& ev : event_set) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, ev, 0));
+    }
+  }
+}
+
 Status NCCLAllreduce::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
   auto& first_entry = entries[0];
@@ -130,6 +146,8 @@ Status NCCLAllreduce::Execute(std::vector<TensorTableEntry>& entries,
   gpu_op_context_.InitGPU(entries);
   nccl_op_context_.InitNCCLComm(entries, response.devices());
   gpu_op_context_.InitGPUQueue(entries, response);
+
+  WaitForData(entries);
 
   const void* fused_input_data;
   void* buffer_data;
@@ -184,6 +202,22 @@ Status NCCLAllreduce::Execute(std::vector<TensorTableEntry>& entries,
 }
 
 #if HAVE_MPI
+void NCCLHierarchicalAllreduce::WaitForData(std::vector<TensorTableEntry>& entries) {
+  if (global_state_->timeline.Initialized()) {
+    // If timeline is initialized, need to use normal CPU syncing path
+    HorovodOp::WaitForData(entries);
+  } else {
+    // Push events to set to deduplicate entries
+    std::unordered_set<gpuEvent_t> event_set;
+    for (auto& e : entries) {
+      e.ready_event_list.PushEventsToSet(event_set);
+    }
+    for (auto& ev : event_set) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, ev, 0));
+    }
+  }
+}
+
 Status
 NCCLHierarchicalAllreduce::Execute(std::vector<TensorTableEntry>& entries,
                                    const Response& response) {
@@ -200,6 +234,8 @@ NCCLHierarchicalAllreduce::Execute(std::vector<TensorTableEntry>& entries,
   gpu_op_context_.InitGPU(entries);
   nccl_op_context_.InitNCCLComm(entries, nccl_device_map);
   gpu_op_context_.InitGPUQueue(entries, response);
+
+  WaitForData(entries);
 
   const void* fused_input_data;
   void* buffer_data;
@@ -320,7 +356,8 @@ NCCLHierarchicalAllreduce::Execute(std::vector<TensorTableEntry>& entries,
     gpu_op_context_.host_buffer = malloc(total_buffer_len);
 
     // Synchronize.
-    gpu_context_->WaitForEvents(gpu_op_context_.event_queue, entries, timeline, nccl_op_context_.error_check_callback_);
+    gpu_context_->WaitForEvents(gpu_op_context_.event_queue, entries, timeline, nccl_op_context_.error_check_callback_,
+                                global_state_->elastic_enabled);
 
     // According to https://docs.nvidia.com/cuda/cuda-runtime-api/
     // api-sync-behavior.html#api-sync-behavior__memcpy-async,
@@ -398,6 +435,22 @@ bool NCCLHierarchicalAllreduce::Enabled(const ParameterManager& param_manager,
 }
 #endif
 
+void NCCLBroadcast::WaitForData(std::vector<TensorTableEntry>& entries) {
+  if (global_state_->timeline.Initialized()) {
+    // If timeline is initialized, need to use normal CPU syncing path
+    HorovodOp::WaitForData(entries);
+  } else {
+    // Push events to set to deduplicate entries
+    std::unordered_set<gpuEvent_t> event_set;
+    for (auto& e : entries) {
+      e.ready_event_list.PushEventsToSet(event_set);
+    }
+    for (auto& ev : event_set) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, ev, 0));
+    }
+  }
+}
+
 Status NCCLBroadcast::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
   assert(entries.size() == 1);
@@ -406,6 +459,8 @@ Status NCCLBroadcast::Execute(std::vector<TensorTableEntry>& entries,
   gpu_op_context_.InitGPU(entries);
   nccl_op_context_.InitNCCLComm(entries, response.devices());
   gpu_op_context_.InitGPUQueue(entries, response);
+
+  WaitForData(entries);
 
   // On root rank, ncclbcast sends data, on other ranks it receives data.
   void* data_ptr;
@@ -431,6 +486,22 @@ Status NCCLBroadcast::Execute(std::vector<TensorTableEntry>& entries,
   return gpu_op_context_.FinalizeGPUQueue(entries, true, nccl_op_context_.error_check_callback_);
 }
 
+void NCCLAllgather::WaitForData(std::vector<TensorTableEntry>& entries) {
+  if (global_state_->timeline.Initialized()) {
+    // If timeline is initialized, need to use normal CPU syncing path
+    HorovodOp::WaitForData(entries);
+  } else {
+    // Push events to set to deduplicate entries
+    std::unordered_set<gpuEvent_t> event_set;
+    for (auto& e : entries) {
+      e.ready_event_list.PushEventsToSet(event_set);
+    }
+    for (auto& ev : event_set) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, ev, 0));
+    }
+  }
+}
+
 Status NCCLAllgather::Execute(std::vector<TensorTableEntry>& entries,
                                 const Response& response) {
   auto& first_entry = entries[0];
@@ -438,6 +509,8 @@ Status NCCLAllgather::Execute(std::vector<TensorTableEntry>& entries,
   gpu_op_context_.InitGPU(entries);
   nccl_op_context_.InitNCCLComm(entries, response.devices());
   gpu_op_context_.InitGPUQueue(entries, response);
+
+  WaitForData(entries);
 
   // Sizes of subcomponents of each entry from all ranks
   auto** entry_component_sizes = new int64_t* [entries.size()];
@@ -564,6 +637,22 @@ bool NCCLAllgather::Enabled(const ParameterManager& param_manager,
   return entries[0].device != CPU_DEVICE_ID;
 }
 
+void NCCLAlltoall::WaitForData(std::vector<TensorTableEntry>& entries) {
+  if (global_state_->timeline.Initialized()) {
+    // If timeline is initialized, need to use normal CPU syncing path
+    HorovodOp::WaitForData(entries);
+  } else {
+    // Push events to set to deduplicate entries
+    std::unordered_set<gpuEvent_t> event_set;
+    for (auto& e : entries) {
+      e.ready_event_list.PushEventsToSet(event_set);
+    }
+    for (auto& ev : event_set) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, ev, 0));
+    }
+  }
+}
+
 Status NCCLAlltoall::Execute(std::vector<TensorTableEntry>& entries,
                              const Response& response) {
 #ifdef NCCL_P2P_SUPPORTED
@@ -573,6 +662,8 @@ Status NCCLAlltoall::Execute(std::vector<TensorTableEntry>& entries,
   gpu_op_context_.InitGPU(entries);
   nccl_op_context_.InitNCCLComm(entries, response.devices());
   gpu_op_context_.InitGPUQueue(entries, response);
+
+  WaitForData(entries);
 
   std::vector<int32_t> sdispls, rdispls;
   std::vector<int32_t> sendcounts, recvcounts;

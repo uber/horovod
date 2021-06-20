@@ -83,7 +83,7 @@ Status DDLAllreduce::Execute(std::vector<TensorTableEntry>& entries, const Respo
   }
 
   // Synchronize.
-  gpu_context_->WaitForEvents(gpu_op_context_.event_queue, entries, timeline);
+  gpu_context_->WaitForEvents(gpu_op_context_.event_queue, entries, timeline, nullptr, global_state_->elastic_enabled);
 
   DDL_Type ddl_data_type = GetDDLDataType(first_entry.tensor);
   auto ddl_result = ddl_allreduce(buffer_data, (size_t) num_elements, ddl_data_type,

@@ -17,15 +17,15 @@
 #include "gpu_operations.h"
 #include "cuda/cuda_kernels.h"
 #include "../message.h"
+#include "../hashes.h"
 
 #include <thread>
 
 namespace horovod {
 namespace common {
-
 class GPUContext::impl {
 public:
-  cudaError_t GetGpuEvent(cudaEvent_t* event) {
+  cudaError_t GetGpuEvent(Event* event, cudaStream_t stream) {
     int device;
     auto status = cudaGetDevice(&device);
     if (status != cudaSuccess) {
@@ -35,7 +35,18 @@ public:
     auto& mutex = cuda_events_mutex;
     {
       std::lock_guard<std::mutex> guard(mutex);
-      auto& queue = cuda_events[device];
+      auto key = std::make_pair(device, stream);
+      auto& queue = cuda_events[key];
+      if (!prepopulated[key]) {
+        // On first call for device and stream pair, prepopulate event queue.
+        // This is to minimize event reuse of callback events passed to framework.
+        for (int i = 0; i < N_CUDA_EVENTS_PREPOPULATE; ++i) {
+          cudaEvent_t ev;
+          status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+          queue.emplace(std::make_shared<cudaEvent_t>(ev), stream);
+        }
+        prepopulated[key] = true;
+      }
       if (!queue.empty()) {
         *event = queue.front();
         queue.pop();
@@ -43,10 +54,15 @@ public:
       }
     }
 
-    return cudaEventCreateWithFlags(event, cudaEventDisableTiming);
+    cudaEvent_t ev;
+    status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    event->event = std::make_shared<cudaEvent_t>(ev);
+    event->stream = stream;
+
+    return status;
   }
 
-  cudaError_t ReleaseGpuEvent(cudaEvent_t event) {
+  cudaError_t ReleaseGpuEvent(Event event) {
     int device;
     auto status = cudaGetDevice(&device);
     if (status != cudaSuccess) {
@@ -56,7 +72,7 @@ public:
     auto& mutex = cuda_events_mutex;
     {
       std::lock_guard<std::mutex> guard(mutex);
-      auto& queue = cuda_events[device];
+      auto& queue = cuda_events[std::make_pair(device, event.stream)];
       queue.push(event);
     }
 
@@ -69,19 +85,27 @@ public:
     }
   }
 
-  void RecordEvent(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue, std::string name, cudaStream_t& stream) {
-    cudaEvent_t event;
-    ErrorCheck("GetGpuEvent", GetGpuEvent(&event));
-    ErrorCheck("cudaEventRecord", cudaEventRecord(event, stream));
+  void RecordEvent(std::queue<std::pair<std::string, Event>>& event_queue, std::string name, cudaStream_t& stream) {
+    Event event;
+    ErrorCheck("GetGpuEvent", GetGpuEvent(&event, stream));
+    ErrorCheck("cudaEventRecord", cudaEventRecord(*(event.event), event.stream));
     event_queue.emplace(name, event);
   }
 
-  void WaitForEvents(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue,
+  Event RecordEvent(cudaStream_t& stream) {
+    Event event;
+    ErrorCheck("GetGpuEvent", GetGpuEvent(&event, stream));
+    ErrorCheck("cudaEventRecord", cudaEventRecord(*(event.event), event.stream));
+    return event;
+  }
+
+  void WaitForEvents(std::queue<std::pair<std::string, Event>>& event_queue,
       const std::vector<TensorTableEntry>& entries, Timeline& timeline,
-      const std::function<void()>& error_check_callback) {
+      const std::function<void()>& error_check_callback,
+      bool elastic) {
     while (!event_queue.empty()) {
       std::string name;
-      cudaEvent_t event;
+      Event event;
       std::tie(name, event) = event_queue.front();
       event_queue.pop();
       if (name != "") {
@@ -89,21 +113,51 @@ public:
       }
 
       // Check for async (networking) errors while waiting for the event to complete
-      cudaError_t cuda_result;
-      while (true) {
-        cuda_result = cudaEventQuery(event);
-        if (cuda_result == cudaSuccess) {
-          break;
-        }
+      if (elastic) {
+        cudaError_t cuda_result;
+        while (true) {
+          cuda_result = cudaEventQuery(*(event.event));
+          if (cuda_result == cudaSuccess) {
+            break;
+          }
 
-        if (cuda_result != cudaErrorNotReady) {
-          throw std::logic_error(std::string("cudaEventQuery failed: ") + cudaGetErrorString(cuda_result));
-        }
+          if (cuda_result != cudaErrorNotReady) {
+            throw std::logic_error(std::string("cudaEventQuery failed: ") + cudaGetErrorString(cuda_result));
+          }
 
+          if (error_check_callback) {
+            error_check_callback();
+          }
+          std::this_thread::yield();
+        }
+      } else {
+        cudaError_t cuda_result = cudaEventSynchronize(*(event.event));
+        if (cuda_result != cudaSuccess) {
+          throw std::logic_error(std::string("cudaEventSynchronize failed: ") + cudaGetErrorString(cuda_result));
+        }
         if (error_check_callback) {
           error_check_callback();
         }
-        std::this_thread::yield();
+      }
+
+      if (name != "") {
+        timeline.ActivityEndAll(entries);
+      }
+      ErrorCheck("ReleaseGpuEvent", ReleaseGpuEvent(event));
+    }
+  }
+
+  void ClearEvents(std::queue<std::pair<std::string, Event>>& event_queue,
+      const std::vector<TensorTableEntry>& entries, Timeline& timeline,
+      const std::function<void()>& error_check_callback,
+      bool elastic) {
+    while (!event_queue.empty()) {
+      std::string name;
+      Event event;
+      std::tie(name, event) = event_queue.front();
+      event_queue.pop();
+      if (name != "") {
+        timeline.ActivityStartAll(entries, name);
       }
 
       if (name != "") {
@@ -157,8 +211,11 @@ public:
 
 private:
   // We reuse CUDA events as it appears that their creation carries non-zero cost.
-  std::unordered_map<int, std::queue<cudaEvent_t>> cuda_events;
+  std::unordered_map<std::pair<int, cudaStream_t>, std::queue<Event>> cuda_events;
+  std::unordered_map<std::pair<int, cudaStream_t>, bool> prepopulated;
   std::mutex cuda_events_mutex;
+
+  static constexpr int N_CUDA_EVENTS_PREPOPULATE = 128;
 };
 
 #include "gpu_context_impl.cc"

@@ -39,7 +39,7 @@ void GPUOpContext::InitGPU(const std::vector<TensorTableEntry>& entries) {
 }
 
 void GPUOpContext::InitGPUQueue(const std::vector<TensorTableEntry>& entries, const Response& response) {
-  event_queue = std::queue<std::pair<std::string, gpuEvent_t>>();
+  event_queue = std::queue<std::pair<std::string, Event>>();
   stream = &gpu_context_->streams[global_state_->current_nccl_stream][entries[0].device];
 
   if (global_state_->timeline.Initialized()) {
@@ -51,7 +51,9 @@ Status GPUOpContext::FinalizeGPUQueue(std::vector<TensorTableEntry>& entries, bo
                                       const std::function<void()>& error_check_callback) {
   // Use completion marker via event because it's faster than
   // blocking gpuStreamSynchronize() in this thread.
-  gpu_context_->RecordEvent(event_queue, "", *stream);
+  if (!global_state_->enable_async_completion) {
+    gpu_context_->RecordEvent(event_queue, "", *stream);
+  }
 
   auto& first_entry = entries[0];
   void* cpu_buffer = host_buffer;
@@ -64,18 +66,35 @@ Status GPUOpContext::FinalizeGPUQueue(std::vector<TensorTableEntry>& entries, bo
   auto fusion_buffer = global_state_->fusion_buffer.GetBuffer(
       first_entry.device, first_entry.context->framework(), global_state_->current_nccl_stream);
 
+  bool elastic = global_state_->elastic_enabled;
+  bool enable_async_completion = global_state_->enable_async_completion;
+  auto current_stream = *stream;
   gpu_context_->finalizer_thread_pool.execute([entries, first_entry, cpu_buffer, fusion_buffer, free_host_buffer,
-                                                evt_queue, &timeline, &gpu_context, error_check_callback]() mutable {
+                                               evt_queue, &timeline, &gpu_context, error_check_callback,
+                                               elastic, enable_async_completion, current_stream]() mutable {
     gpu_context->SetDevice(first_entry.device);
 
-    gpu_context->WaitForEvents(evt_queue, entries, timeline, error_check_callback);
+    Event event;
+    if (!enable_async_completion || timeline.Initialized()) {
+      // If timeline is enabled, wait for events on CPU for accurate timings.
+      gpu_context->WaitForEvents(evt_queue, entries, timeline, error_check_callback, elastic);
+    } else {
+      gpu_context->ClearEvents(evt_queue, entries, timeline, error_check_callback, elastic);
+      event = gpu_context->RecordEvent(current_stream);
+    }
+
     if (free_host_buffer && cpu_buffer != nullptr) {
       free(cpu_buffer);
     }
 
     for (auto& e : entries) {
       timeline.End(e.tensor_name, e.output);
-      e.FinishWithCallback(Status::OK());
+      auto status = Status::OK();
+      status.event = event;
+      e.FinishWithCallback(status);
+    }
+    if (enable_async_completion) {
+      gpu_context->ReleaseEvent(event);
     }
   });
 

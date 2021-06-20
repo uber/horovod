@@ -57,6 +57,9 @@ struct HorovodGlobalState {
   // Flag indicating whether timeline enabled.
   bool timeline_enabled = false;
 
+  // Flag indicating whether running elastic.
+  bool elastic_enabled = false;
+
   // Flag indicating whether to mark cycles in the timeline.
   std::atomic_bool mark_cycles_in_timeline{false};
 
@@ -119,6 +122,9 @@ struct HorovodGlobalState {
 
   // Flag indicating whether to prohibit groups from fusing
   bool disable_group_fusion = false;
+
+  // Flag indicating whether to enable async completion
+  bool enable_async_completion = false;
 
   ~HorovodGlobalState() {
     // Make sure that the destructor of the background thread is safe to

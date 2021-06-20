@@ -86,16 +86,16 @@ TorchReadyEvent::~TorchReadyEvent() {
 }
 
 bool TorchReadyEvent::Ready() const {
-  auto status = cudaEventQuery(cuda_event_);
-  if (status == cudaErrorNotReady) {
-    return false;
-  }
   #if TORCH_VERSION >= 1005000000
-  C10_CUDA_CHECK(status);
+  C10_CUDA_CHECK(cudaEventSynchronize(cuda_event_));
   #else
-  THCudaCheck(status);
+  THCudaCheck(cudaEventSynchronize(cuda_event_));
   #endif
   return true;
+}
+
+gpuEvent_t TorchReadyEvent::event() const {
+  return cuda_event_;
 }
 #endif
 

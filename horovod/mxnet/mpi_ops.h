@@ -33,6 +33,9 @@ using namespace horovod::common;
 
 typedef ::mxnet::NDArray NDArray;
 typedef ::mxnet::Engine::CallbackOnComplete CallbackOnComplete;
+#if MXNET_MAJOR >= 2 || MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+typedef ::mxnet::Engine::CallbackOnStart CallbackOnStart;
+#endif
 typedef Request::RequestType OperationType;
 typedef std::shared_ptr<MXTensor> MXTensorSharedPtr;
 typedef std::shared_ptr<NDArray> NDArraySharedPtr;

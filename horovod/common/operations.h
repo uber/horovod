@@ -114,8 +114,8 @@ int horovod_reduce_op_adasum();
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output,
-                              std::shared_ptr<ReadyEvent> ready_event,
-                              std::string name, int device,
+                              ReadyEventList ready_event_list,
+                              std::string name, const int device,
                               StatusCallback callback,
                               ReduceOp reduce_op = ReduceOp::SUM,
                               double prescale_factor = 1.0,
@@ -124,7 +124,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
 Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts,
                                std::vector<std::shared_ptr<Tensor>>& tensors,
                                std::vector<std::shared_ptr<Tensor>>& outputs,
-                               std::vector<std::shared_ptr<ReadyEvent>>& ready_events,
+                               std::vector<ReadyEventList>& ready_event_lists,
                                std::vector<std::string>& names,
                                int device,
                                std::vector<StatusCallback>& callbacks,
@@ -134,27 +134,27 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
 
 Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
-                              std::shared_ptr<ReadyEvent> ready_event,
-                              const std::string& name, int device,
+                              ReadyEventList ready_event_list,
+                              const std::string& name, const int device,
                               StatusCallback callback);
 
 Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output, int root_rank,
-                              std::shared_ptr<ReadyEvent> ready_event,
-                              const std::string& name, int device,
+                              ReadyEventList ready_event_list,
+                              const std::string& name, const int device,
                               StatusCallback callback);
 
 Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
                              std::shared_ptr<Tensor> tensor,
                              std::shared_ptr<Tensor> splits,
-                             std::shared_ptr<ReadyEvent> ready_event,
-                             const std::string& name, int device,
+                             ReadyEventList ready_event_list,
+                             const std::string& name, const int device,
                              StatusCallback callback);
 
 Status EnqueueJoin(std::shared_ptr<OpContext> context,
-                   std::shared_ptr<ReadyEvent> ready_event,
-                   const std::string& name, int device,
+                   ReadyEventList ready_event_list,
+                   const std::string& name, const int device,
                    StatusCallback callback);
 
 } // namespace common

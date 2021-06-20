@@ -35,11 +35,18 @@ AdasumGpuAllreduceOp::~AdasumGpuAllreduceOp() {
     free(gpu_op_context_.host_buffer);
   }
 }
+
+void AdasumGpuAllreduceOp::WaitForData(std::vector<TensorTableEntry>& entries) {
+  HorovodOp::WaitForData(entries);
+}
+
 Status AdasumGpuAllreduceOp::Execute(std::vector<TensorTableEntry>& entries,
                                      const Response& response) {
   if (entries.empty()) {
     return Status::OK();
   }
+
+  WaitForData(entries);
 
   // Lazily initialize reduction communicators for VHDD algorithm when Adasum reduction is actually called.
   if (!reduction_comms_initialized) {
@@ -190,7 +197,7 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
     host_buffer = GetHostBuffer((uint64_t)total_buffer_len);
     // Synchronize.
     gpu_context_->WaitForEvents(gpu_op_context_.event_queue, entries,
-                                 timeline);
+                                 timeline, nullptr, global_state_->elastic_enabled);
 
     // According to https://docs.nvidia.com/cuda/cuda-runtime-api/
     // api-sync-behavior.html#api-sync-behavior__memcpy-async,

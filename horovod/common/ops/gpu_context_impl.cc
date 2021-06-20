@@ -9,12 +9,28 @@ void GPUContext::ErrorCheck(std::string op_name, gpuError_t gpu_result) {
   pimpl->ErrorCheck(op_name, gpu_result);
 }
 
-void GPUContext::RecordEvent(std::queue<std::pair<std::string, gpuEvent_t>>& event_queue, std::string name, gpuStream_t& stream) {
+void GPUContext::RecordEvent(std::queue<std::pair<std::string, Event>>& event_queue, std::string name, gpuStream_t& stream) {
   pimpl->RecordEvent(event_queue, name, stream);
 }
 
-void GPUContext::WaitForEvents(std::queue<std::pair<std::string, gpuEvent_t>>& event_queue, const std::vector<TensorTableEntry>& entries, Timeline& timeline, const std::function<void()>& error_check_callback) {
-  pimpl->WaitForEvents(event_queue, entries, timeline, error_check_callback);
+Event GPUContext::RecordEvent(gpuStream_t& stream) {
+  return pimpl->RecordEvent(stream);
+}
+
+void GPUContext::ReleaseEvent(Event event) {
+  pimpl->ErrorCheck("ReleaseGpuEvent", pimpl->ReleaseGpuEvent(event));
+}
+
+void GPUContext::WaitForEvents(std::queue<std::pair<std::string, Event>>& event_queue, const std::vector<TensorTableEntry>& entries,
+                               Timeline& timeline, const std::function<void()>& error_check_callback,
+                               bool elastic) {
+  pimpl->WaitForEvents(event_queue, entries, timeline, error_check_callback, elastic);
+}
+
+void GPUContext::ClearEvents(std::queue<std::pair<std::string, Event>>& event_queue, const std::vector<TensorTableEntry>& entries,
+                             Timeline& timeline, const std::function<void()>& error_check_callback,
+                             bool elastic) {
+  pimpl->ClearEvents(event_queue, entries, timeline, error_check_callback, elastic);
 }
 
 void GPUContext::StreamCreate(gpuStream_t *stream) {

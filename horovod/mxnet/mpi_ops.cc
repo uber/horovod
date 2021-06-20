@@ -20,6 +20,10 @@
 #include "cuda_util.h"
 #include "mpi_ops.h"
 
+#if MXNET_MAJOR >= 2 || MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+#define MXNET_ASYNC_GPU_ENGINE_SUPPORTED 1
+#endif
+
 namespace horovod {
 namespace mxnet {
 
@@ -72,7 +76,66 @@ bool IsTensorOnCPU(NDArray* tensor) {
   return tensor->ctx().dev_mask() == cpu::kDevMask;
 }
 
+#if HAVE_CUDA
+class MXReadyEvent : public common::ReadyEvent {
+public:
+  MXReadyEvent(gpuEvent_t event) : event_(event) {};
+  bool Ready() const override {
+      HVD_GPU_CHECK(gpuEventSynchronize(event_));
+      return true;
+  };
+  gpuEvent_t event() const override {
+    return event_;
+  }
+
+private:
+  gpuEvent_t event_;
+};
+#endif
+
+ReadyEventList FormReadyEventList(NDArray* input, NDArray* output) {
+  ReadyEventList ready_event_list;
+
+#if HAVE_CUDA && MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+  // Get events from input tensor writers
+  {
+    auto& sync_obj = input->var()->sync_object;
+    std::lock_guard<std::mutex> l(sync_obj.mutex);
+    if (!sync_obj.writer_event.empty()) {
+      auto ev = sync_obj.writer_event[0].event.lock();
+      if (ev) {
+        ready_event_list.AddReadyEvent(std::make_shared<MXReadyEvent>(*ev));
+      }
+    }
+  }
+
+  // Get events from output tensor reader and writers
+  {
+    auto& sync_obj = output->var()->sync_object;
+    std::lock_guard<std::mutex> l(sync_obj.mutex);
+    for (auto& cuda_event : sync_obj.reader_events) {
+      auto ev = cuda_event.event.lock();
+      if (ev) {
+        ready_event_list.AddReadyEvent(std::make_shared<MXReadyEvent>(*ev));
+      }
+    }
+    if (!sync_obj.writer_event.empty()) {
+      auto ev = sync_obj.writer_event[0].event.lock();
+      if (ev) {
+        ready_event_list.AddReadyEvent(std::make_shared<MXReadyEvent>(*ev));
+      }
+    }
+  }
+#endif
+  return ready_event_list;
+}
+
+#if MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+void DoHorovodOperation(void*, void* on_start_ptr, void* on_complete_ptr, void* param) {
+  auto on_start = *static_cast<CallbackOnStart*>(on_start_ptr);
+#else
 void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
+#endif
   ThrowIfError(common::CheckInitialized());
 
   auto on_complete = *static_cast<CallbackOnComplete*>(on_complete_ptr);
@@ -87,15 +150,19 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
   std::vector<std::shared_ptr<Tensor>> hvd_tensors;
   std::vector<std::shared_ptr<OpContext>> hvd_contexts;
   std::vector<StatusCallback> callbacks;
-  std::vector<std::shared_ptr<ReadyEvent>> ready_events(num_tensors); // default initialization to nullptr
+  std::vector<ReadyEventList> ready_event_lists;
   hvd_tensors.reserve(num_tensors);
   hvd_contexts.reserve(num_tensors);
+  ready_event_lists.reserve(num_tensors);
   callbacks.reserve(num_tensors);
 
   auto callback_mutex = std::make_shared<std::mutex>();
   for (int i = 0; i < num_tensors; ++i) {
     auto input_tensor = ops_param->input_tensors[i].get();
+    auto output_tensor = ops_param->output_tensors[i].get();
     auto output = ops_param->outputs[i];
+
+    ready_event_lists.emplace_back(FormReadyEventList(input_tensor, output_tensor));
 
     hvd_tensors.emplace_back(std::make_shared<MXTensor>(input_tensor));
     if (TensorUtil::GetDevice(input_tensor) != device) {
@@ -106,8 +173,61 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
       ctx->AddOutput(ops_param->received_splits_tensor.get());
     }
     hvd_contexts.push_back(ctx);
-    callbacks.emplace_back([on_complete, ops_param, callback_mutex](const Status& status) {
-      // Must only invoke callback on last tensor to prevent premature deletion of
+    callbacks.emplace_back([on_complete, ops_param, callback_mutex, i](const Status& status) {
+      auto input_tensor = ops_param->input_tensors[i].get();
+      auto output_tensor = ops_param->output_tensors[i].get();
+#if HAVE_CUDA
+      auto hvd_event = status.event;
+      if (hvd_event.event) {
+#if MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+        auto async_engine_enabled = dmlc::GetEnv("MXNET_ASYNC_GPU_ENGINE", false);
+        if (async_engine_enabled) {
+          {
+            auto &sync_obj = input_tensor->var()->sync_object;
+            std::lock_guard<std::mutex> l(sync_obj.mutex);
+            // If some reader event is already recorded on the same stream,
+            // we want to replace ourselves by it
+            int i;
+            for (i = 0; i < sync_obj.reader_events.size(); ++i) {
+              auto stream = sync_obj.reader_events[i].stream;
+              if (stream == hvd_event.stream) {
+                sync_obj.reader_events[i].event = hvd_event.event;
+                sync_obj.reader_events[i].pool_index = 0;
+                break;
+              }
+            }
+            if (i == sync_obj.reader_events.size()) {
+              sync_obj.reader_events.push_back({hvd_event.event, hvd_event.stream, 0});
+            }
+          }
+
+          {
+            auto &sync_obj = output_tensor->var()->sync_object;
+            std::lock_guard<std::mutex> l(sync_obj.mutex);
+            sync_obj.reader_events.clear();
+            sync_obj.writer_event.clear();
+            sync_obj.writer_event.push_back({hvd_event.event, hvd_event.stream, 0});
+          }
+
+          if (ops_param->received_splits_tensor) {
+            {
+              auto &sync_obj = ops_param->received_splits_tensor.get()->var()->sync_object;
+              std::lock_guard<std::mutex> l(sync_obj.mutex);
+              sync_obj.reader_events.clear();
+              sync_obj.writer_event.clear();
+              sync_obj.writer_event.push_back({hvd_event.event, hvd_event.stream, 0});
+            }
+          }
+        } else {
+          HVD_GPU_CHECK(gpuEventSynchronize(*(hvd_event.event)));
+        }
+#else
+        HVD_GPU_CHECK(gpuEventSynchronize(*(hvd_event.event)));
+#endif
+      }
+#endif
+
+      // Must only invoke MXNet callback on last tensor to prevent premature deletion of
       // shared ops_param structure. Guard logic is here instead of within DeleteMpiOpsParam
       // function as on_complete can only be invoked once due to MXNet internally
       // pairing up the engine op completion callback with DeleteMpiOpsParam.
@@ -130,12 +250,12 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
       }
 
       enqueue_result = EnqueueTensorAllreduces(
-          hvd_contexts, hvd_tensors, hvd_outputs, ready_events, ops_param->op_names, device,
+          hvd_contexts, hvd_tensors, hvd_outputs, ready_event_lists, ops_param->op_names, device,
           callbacks, (average) ? ReduceOp::AVERAGE : ReduceOp::SUM, prescale_factor, postscale_factor);
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
-          hvd_contexts[0], hvd_tensors[0], ready_events[0], ops_param->op_names[0], device,
+          hvd_contexts[0], hvd_tensors[0], ready_event_lists[0], ops_param->op_names[0], device,
           callbacks[0]);
       break;
     case OperationType::BROADCAST:
@@ -147,14 +267,17 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
 
       enqueue_result = EnqueueTensorBroadcast(
           hvd_contexts[0], hvd_tensors[0], hvd_outputs[0], ops_param->root_rank,
-          ready_events[0], ops_param->op_names[0], device,
+          ready_event_lists[0], ops_param->op_names[0], device,
           callbacks[0]);
       break;
     case OperationType::ALLTOALL:
     {
+#if MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+      on_start(); // Need to call on_start to sync on possible D2H copy of splits tensor.
+#endif
       auto hvd_splits = std::make_shared<MXTensor>(ops_param->splits_tensor.get());
       enqueue_result = EnqueueTensorAlltoall(
-          hvd_contexts[0], hvd_tensors[0], hvd_splits, ready_events[0], ops_param->op_names[0],
+          hvd_contexts[0], hvd_tensors[0], hvd_splits, ready_event_lists[0], ops_param->op_names[0],
           device, callbacks[0]);
       break;
     }
@@ -266,7 +389,12 @@ inline void PushHorovodOperation(OperationType op_type, NDArray* const * inputs,
   }
 }
 #if HAVE_CUDA
+#if MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+void DoHorovodOperationCudaOnCPU(void*, void* on_start_ptr, void* on_complete_ptr, void* param) {
+  auto on_start = *static_cast<CallbackOnComplete*>(on_start_ptr);
+#else
 void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
+#endif
   ThrowIfError(common::CheckInitialized());
 
   auto on_complete = *static_cast<CallbackOnComplete*>(on_complete_ptr);
@@ -280,15 +408,18 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
   std::vector<std::shared_ptr<Tensor>> hvd_cpu_buffers;
   std::vector<std::shared_ptr<OpContext>> hvd_contexts;
   std::vector<StatusCallback> callbacks;
-  std::vector<std::shared_ptr<ReadyEvent>> ready_events(num_tensors); // default initialization to nullptr
+  std::vector<ReadyEventList> ready_event_lists;
   hvd_cpu_buffers.reserve(num_tensors);
   hvd_contexts.reserve(num_tensors);
+  ready_event_lists.reserve(num_tensors);
   callbacks.reserve(num_tensors);
 
   auto callback_mutex = std::make_shared<std::mutex>();
   for (int i = 0; i < num_tensors; ++i) {
     auto input = ops_param->cpu_input_tensors[i].get();
     auto output = ops_param->cpu_output_tensors[i].get();
+
+    ready_event_lists.emplace_back(FormReadyEventList(input, output));
 
     hvd_cpu_buffers.emplace_back(std::make_shared<MXTensor>(input));
     if (TensorUtil::GetDevice(input) != device) {
@@ -317,25 +448,25 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
   switch (ops_param->op_type) {
     case OperationType::ALLREDUCE:
       enqueue_result = EnqueueTensorAllreduces(
-          hvd_contexts, hvd_cpu_buffers, hvd_cpu_buffers, ready_events, ops_param->op_names, device,
+          hvd_contexts, hvd_cpu_buffers, hvd_cpu_buffers, ready_event_lists, ops_param->op_names, device,
           callbacks, (average) ? ReduceOp::AVERAGE : ReduceOp::SUM, prescale_factor, postscale_factor);
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
-          hvd_contexts[0], hvd_cpu_buffers[0], ready_events[0], ops_param->op_names[0], device,
+          hvd_contexts[0], hvd_cpu_buffers[0], ready_event_lists[0], ops_param->op_names[0], device,
           callbacks[0]);
       break;
     case OperationType::BROADCAST:
       enqueue_result = EnqueueTensorBroadcast(
           hvd_contexts[0], hvd_cpu_buffers[0], hvd_cpu_buffers[0], ops_param->root_rank,
-          ready_events[0], ops_param->op_names[0], device,
+          ready_event_lists[0], ops_param->op_names[0], device,
           callbacks[0]);
       break;
     case OperationType::ALLTOALL:
     {
       auto hvd_splits = std::make_shared<MXTensor>(ops_param->splits_tensor.get());
       enqueue_result = EnqueueTensorAlltoall(
-          hvd_contexts[0], hvd_cpu_buffers[0], hvd_splits, ready_events[0], ops_param->op_names[0],
+          hvd_contexts[0], hvd_cpu_buffers[0], hvd_splits, ready_event_lists[0], ops_param->op_names[0],
           device, callbacks[0]);
       break;
     }

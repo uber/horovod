@@ -31,6 +31,8 @@ Status MPI_GPUAllreduce::Execute(std::vector<TensorTableEntry>& entries, const R
 
   gpu_op_context_.InitGPU(entries);
 
+  WaitForData(entries);
+
   const void* fused_input_data;
   void* buffer_data;
   size_t buffer_len;
@@ -100,6 +102,8 @@ Status MPI_GPUAllgather::Execute(std::vector<TensorTableEntry>& entries, const R
   auto& timeline = global_state_->timeline;
 
   gpu_op_context_.InitGPU(entries);
+
+  WaitForData(entries);
 
   // Sizes of subcomponents of each entry from all ranks
   auto** entry_component_sizes = new int64_t* [entries.size()];
@@ -195,6 +199,9 @@ Status MPI_GPUAlltoall::Execute(std::vector<TensorTableEntry>& entries, const Re
   assert(entries.size() == 1);
 
   gpu_op_context_.InitGPU(entries);
+
+  WaitForData(entries);
+
   auto e = entries[0];
 
   std::vector<int32_t> sdispls, rdispls;

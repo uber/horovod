@@ -89,6 +89,8 @@ public:
                  const Response& response) override;
 
 protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
   NCCLContext* nccl_context_;
   NCCLOpContext nccl_op_context_;
   HorovodGlobalState* global_state_;
@@ -107,6 +109,8 @@ public:
                  const Response& response) override;
 
 protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
   NCCLContext* nccl_context_;
   NCCLOpContext nccl_op_context_;
   HorovodGlobalState* global_state_;
@@ -125,6 +129,8 @@ public:
                  const Response& response) override;
 
 protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
   NCCLContext* nccl_context_;
   NCCLOpContext nccl_op_context_;
   HorovodGlobalState* global_state_;
@@ -145,6 +151,9 @@ public:
   bool Enabled(const ParameterManager& param_manager,
                const std::vector<TensorTableEntry>& entries,
                const Response& response) const override;
+
+protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
 
 private:
   MPIContext* mpi_context_;
@@ -167,6 +176,8 @@ public:
                const Response& response) const override;
 
 protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
   NCCLContext* nccl_context_;
   NCCLOpContext nccl_op_context_;
   HorovodGlobalState* global_state_;

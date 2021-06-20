@@ -24,12 +24,15 @@ MPIAllreduce::MPIAllreduce(MPIContext* mpi_context, HorovodGlobalState* global_s
     : AllreduceOp(global_state), mpi_context_(mpi_context) {}
 
 Status MPIAllreduce::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   auto& first_entry = entries[0];
 
   const void* fused_input_data;
   void* buffer_data;
   size_t buffer_len;
   int64_t num_elements = NumElements(entries);
+
 
   // Copy memory into the fusion buffer.
   auto& timeline = global_state_->timeline;
@@ -94,6 +97,8 @@ bool MPIAllgather::Enabled(const ParameterManager& param_manager,
 }
 
 Status MPIAllgather::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   auto& timeline = global_state_->timeline;
 
   // Sizes of subcomponents of each entry from all ranks
@@ -188,6 +193,8 @@ MPIHierarchicalAllgather::MPIHierarchicalAllgather(MPIContext* mpi_context,
     : MPIAllgather(mpi_context, global_state) {}
 
 Status MPIHierarchicalAllgather::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   auto& timeline = global_state_->timeline;
 
   // Sizes of subcomponents of each entry from all ranks
@@ -355,6 +362,8 @@ MPIBroadcast::MPIBroadcast(MPIContext* mpi_context, HorovodGlobalState* global_s
     : BroadcastOp(global_state), mpi_context_(mpi_context) {}
 
 Status MPIBroadcast::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto e = entries[0];
 
@@ -390,6 +399,8 @@ MPIAlltoall::MPIAlltoall(MPIContext* mpi_context, HorovodGlobalState* global_sta
     : AlltoallOp(global_state), mpi_context_(mpi_context) {}
 
 Status MPIAlltoall::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  WaitForData(entries);
+
   assert(entries.size() == 1);
   auto e = entries[0];
 

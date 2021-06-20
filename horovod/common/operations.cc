@@ -284,32 +284,6 @@ void PerformOperation(Response response, HorovodGlobalState& state) {
         return;
       }
     }
-
-    // On GPU data readiness is signalled by ready_event.
-    std::vector<TensorTableEntry> waiting_tensors;
-    for (auto& e : entries) {
-      if (e.ready_event != nullptr) {
-        timeline.ActivityStart(e.tensor_name, WAIT_FOR_DATA);
-        waiting_tensors.push_back(e);
-      }
-    }
-    while (!waiting_tensors.empty()) {
-      for (auto it = waiting_tensors.begin(); it != waiting_tensors.end();) {
-        if (it->ready_event->Ready()) {
-          timeline.ActivityEnd(it->tensor_name);
-          timeline.ActivityStart(it->tensor_name, WAIT_FOR_OTHER_TENSOR_DATA);
-          it = waiting_tensors.erase(it);
-        } else {
-          ++it;
-        }
-      }
-      std::this_thread::sleep_for(std::chrono::nanoseconds(100));
-    }
-    for (auto& e : entries) {
-      if (e.ready_event != nullptr) {
-        timeline.ActivityEnd(e.tensor_name);
-      }
-    }
   }
 
   Status status;
@@ -437,6 +411,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   }
   state.controller->SetTimelineEnabled(should_enable_timeline);
 
+  SetBoolFromEnv(HOROVOD_ELASTIC, state.elastic_enabled, true);
+
   ParseStallInspectorFromEnv(state.controller->GetStallInspector());
   bool mark_cycles = false;
   SetBoolFromEnv(HOROVOD_TIMELINE_MARK_CYCLES, mark_cycles,
@@ -520,6 +496,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
   // Check if group fusion should be disabled
   SetBoolFromEnv(HOROVOD_DISABLE_GROUP_FUSION, state.disable_group_fusion, true);
+
+  // Check if async completion should be enabled
+  SetBoolFromEnv(HOROVOD_ENABLE_ASYNC_COMPLETION, state.enable_async_completion, true);
 
   // Enable auto-tuning.
   auto horovod_autotune = std::getenv(HOROVOD_AUTOTUNE);
@@ -919,7 +898,7 @@ int horovod_reduce_op_adasum() {
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output,
-                              std::shared_ptr<ReadyEvent> ready_event,
+                              ReadyEventList ready_event_list,
                               std::string name, const int device,
                               StatusCallback callback,
                               ReduceOp reduce_op,
@@ -929,18 +908,18 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   std::vector<std::shared_ptr<OpContext>> contexts;
   std::vector<std::shared_ptr<Tensor>> tensors;
   std::vector<std::shared_ptr<Tensor>> outputs;
-  std::vector<std::shared_ptr<ReadyEvent>> ready_events;
+  std::vector<ReadyEventList> ready_event_lists;
   std::vector<std::string> names;
   std::vector<StatusCallback> callbacks;
 
   contexts.emplace_back(std::move(context));
   tensors.emplace_back(std::move(tensor));
   outputs.emplace_back(std::move(output));
-  ready_events.emplace_back(std::move(ready_event));
+  ready_event_lists.emplace_back(std::move(ready_event_list));
   names.emplace_back(std::move(name));
   callbacks.emplace_back(std::move(callback));
 
-  return EnqueueTensorAllreduces(contexts, tensors, outputs, ready_events,
+  return EnqueueTensorAllreduces(contexts, tensors, outputs, ready_event_lists,
                                  names, device, callbacks, reduce_op,
                                  prescale_factor, postscale_factor);
 }
@@ -948,7 +927,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
 Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts,
                                std::vector<std::shared_ptr<Tensor>>& tensors,
                                std::vector<std::shared_ptr<Tensor>>& outputs,
-                               std::vector<std::shared_ptr<ReadyEvent>>& ready_events,
+                               std::vector<ReadyEventList>& ready_event_lists,
                                std::vector<std::string>& names,
                                const int device,
                                std::vector<StatusCallback>& callbacks,
@@ -1008,7 +987,7 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
       e.tensor = tensors[n];
       e.output = outputs[n];
     }
-    e.ready_event = std::move(ready_events[n]);
+    e.ready_event_list = std::move(ready_event_lists[n]);
     e.device = device;
     e.callback = std::move(callbacks[n]);
 
@@ -1059,7 +1038,7 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
 // must be running before this function is called.
 Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
-                              std::shared_ptr<ReadyEvent> ready_event,
+                              ReadyEventList ready_event_list,
                               const std::string& name, const int device,
                               StatusCallback callback) {
   Request message;
@@ -1076,7 +1055,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   e.tensor_name = name;
   e.context = context;
   e.tensor = tensor;
-  e.ready_event = ready_event;
+  e.ready_event_list = ready_event_list;
   e.device = device;
   e.callback = callback;
   e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodAllgather, e.tensor->size());
@@ -1096,7 +1075,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
 Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output, int root_rank,
-                              std::shared_ptr<ReadyEvent> ready_event,
+                              ReadyEventList ready_event_list,
                               const std::string& name, const int device,
                               StatusCallback callback) {
   Request message;
@@ -1116,7 +1095,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   e.tensor = tensor;
   e.output = output;
   e.root_rank = root_rank;
-  e.ready_event = ready_event;
+  e.ready_event_list = ready_event_list;
   e.device = device;
   e.callback = callback;
   e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodBroadcast, e.tensor->size());
@@ -1136,7 +1115,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
 Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
                              std::shared_ptr<Tensor> tensor,
                              std::shared_ptr<Tensor> splits,
-                             std::shared_ptr<ReadyEvent> ready_event,
+                             ReadyEventList ready_event_list,
                              const std::string& name, const int device,
                              StatusCallback callback) {
   // Check arguments
@@ -1161,7 +1140,7 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
   e.tensor_name = name;
   e.context = context;
   e.tensor = tensor;
-  e.ready_event = ready_event;
+  e.ready_event_list = ready_event_list;
   e.device = device;
   e.callback = callback;
   e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodAlltoall, e.tensor->size());
@@ -1200,7 +1179,7 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
 // Contexts and controller must be initialized and the background thread
 // must be running before this function is called.
 Status EnqueueJoin(std::shared_ptr<OpContext> context,
-                   std::shared_ptr<ReadyEvent> ready_event,
+                   ReadyEventList ready_event_list,
                    const std::string& name, const int device,
                    StatusCallback callback) {
   Request message;
@@ -1211,7 +1190,7 @@ Status EnqueueJoin(std::shared_ptr<OpContext> context,
   TensorTableEntry e;
   e.tensor_name = name;
   e.context = context;
-  e.ready_event = ready_event;
+  e.ready_event_list = ready_event_list;
   e.device = device;
   e.callback = callback;
 

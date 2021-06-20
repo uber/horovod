@@ -25,6 +25,8 @@
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
 
+#include "../common/common.h"
+
 #define EIGEN_USE_THREADS
 
 #if HAVE_GPU
@@ -120,14 +122,26 @@ common::Status ConvertStatus(const Status& status) {
   }
 }
 
+int GetDeviceID(OpKernelContext* context);
+
 #if HAVE_GPU
+struct ReadyEventRegistry {
+  std::unordered_map<int, std::queue<gpuEvent_t>> gpu_events;
+  std::mutex mutex;
+};
+
+static ReadyEventRegistry ready_event_registry;
+
 class TFReadyEvent : public common::ReadyEvent {
 public:
-  TFReadyEvent(DeviceContext* device_context);
+  TFReadyEvent(OpKernelContext* context);
+  ~TFReadyEvent();
   bool Ready() const override;
+  gpuEvent_t event() const override;
 
 private:
-  std::shared_ptr<perftools::gputools::Event> event_;
+  gpuEvent_t event_;
+  int device_ = CPU_DEVICE_ID;
 };
 #endif
 
@@ -176,18 +190,40 @@ private:
 };
 
 #if HAVE_GPU
-TFReadyEvent::TFReadyEvent(DeviceContext* device_context) {
-  auto executor = device_context->stream()->parent();
-  auto ready_event = new perftools::gputools::Event(executor);
-  ready_event->Init();
-  device_context->stream()->ThenRecordEvent(ready_event);
-  event_ = std::shared_ptr<perftools::gputools::Event>(ready_event);
+TFReadyEvent::TFReadyEvent(OpKernelContext* context) {
+  device_ = GetDeviceID(context);
+  {
+    std::lock_guard<std::mutex> guard(ready_event_registry.mutex);
+    auto& queue = ready_event_registry.gpu_events[device_];
+    if (!queue.empty()) {
+      event_ = queue.front();
+      queue.pop();
+    } else {
+      HVD_GPU_CHECK(gpuEventCreateWithFlags(&event_, gpuEventDisableTiming));
+    }
+  }
+  auto device_context = context->op_device_context();
+  auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+  HVD_GPU_CHECK(gpuEventRecord(event_, stream));
 }
 
 bool TFReadyEvent::Ready() const {
-  return event_->PollForStatus() !=
-         perftools::gputools::Event::Status::kPending;
+  HVD_GPU_CHECK(gpuEventSynchronize(event_));
+  return true;
 }
+
+gpuEvent_t TFReadyEvent::event() const {
+  return event_;
+}
+
+TFReadyEvent::~TFReadyEvent() {
+  {
+    std::lock_guard<std::mutex> guard(ready_event_registry.mutex);
+    auto& queue = ready_event_registry.gpu_events[device_];
+    queue.push(event_);
+  }
+}
+
 #endif
 
 TFPersistentBuffer::TFPersistentBuffer(OpKernelContext* context, int64_t size) {
@@ -358,15 +394,15 @@ int GetDeviceID(OpKernelContext* context) {
 
 // On GPU this event will signal that data is ready, and tensors are
 // allocated.
-common::ReadyEvent* RecordReadyEvent(OpKernelContext* context) {
 #if HAVE_GPU
+common::ReadyEvent* RecordReadyEvent(OpKernelContext* context) {
   auto device_context = context->op_device_context();
   if (device_context != nullptr) {
-    return new TFReadyEvent(device_context);
+    return new TFReadyEvent(context);
   }
-#endif
   return nullptr;
 }
+#endif
 
 } // namespace
 
@@ -398,13 +434,26 @@ public:
     OP_REQUIRES_OK_ASYNC(
         context, context->allocate_output(0, tensor.shape(), &output), done);
     // ReadyEvent makes sure input tensor is ready, and output is allocated.
-    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto hvd_output = std::make_shared<TFTensor>(*output);
     auto enqueue_result = EnqueueTensorAllreduce(
-        hvd_context, hvd_tensor, hvd_output, ready_event, node_name, device,
+        hvd_context, hvd_tensor, hvd_output, ready_event_list, node_name, device,
         [context, done](const common::Status& status) {
+#if HAVE_GPU
+          auto hvd_event = status.event;
+          if (hvd_event.event) {
+            auto device_context = context->op_device_context();
+            if (device_context != nullptr) {
+                auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+            }
+          }
+#endif
           context->SetStatus(ConvertStatus(status));
           done();
         }, reduce_op, (double) prescale_factor_, (double) postscale_factor_);
@@ -477,13 +526,13 @@ public:
     horovod::common::ReduceOp reduce_op = static_cast<horovod::common::ReduceOp>(reduce_op_);
     std::vector<Tensor*> outputs(num_tensors_);
 
-    std::vector<std::shared_ptr<common::ReadyEvent>> ready_events;
+    std::vector<common::ReadyEventList> ready_event_lists;
     std::vector<std::shared_ptr<common::OpContext>> hvd_contexts;
     std::vector<std::shared_ptr<common::Tensor>> hvd_tensors;
     std::vector<std::shared_ptr<common::Tensor>> hvd_outputs;
     std::vector<common::StatusCallback> callbacks;
     std::vector<std::string> names;
-    ready_events.reserve(num_tensors_);
+    ready_event_lists.reserve(num_tensors_);
     hvd_contexts.reserve(num_tensors_);
     hvd_tensors.reserve(num_tensors_);
     hvd_outputs.reserve(num_tensors_);
@@ -498,9 +547,17 @@ public:
       OP_REQUIRES_OK_ASYNC(
           context, context->allocate_output(i, tensor.shape(), &outputs[i]),
           done);
-      // ReadyEvent makes sure input tensor is ready, and output is allocated.
-      ready_events.emplace_back(
-          std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+    }
+
+    // ReadyEvent makes sure input tensors are ready, and outputs are allocated.
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
+
+    for (int i = 0; i < num_tensors_; ++i) {
+      auto tensor = context->input(i);
+      ready_event_lists.emplace_back(ready_event_list); // Same for all tensors in group
       hvd_contexts.emplace_back(std::make_shared<TFOpContext>(context));
       hvd_tensors.emplace_back(std::make_shared<TFTensor>(tensor));
       names.emplace_back(node_name + "_" + std::to_string(i + 1) + "of" +
@@ -513,6 +570,16 @@ public:
             std::lock_guard<std::mutex> guard(*callback_mutex);
             (*callback_count)++;
             if (*callback_count == num_tensors) {
+#if HAVE_GPU
+              auto hvd_event = status.event;
+              if (hvd_event.event) {
+                auto device_context = context->op_device_context();
+                if (device_context != nullptr) {
+                    auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                    HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+                }
+              }
+#endif
               context->SetStatus(ConvertStatus(status));
               done();
             }
@@ -520,7 +587,7 @@ public:
     }
 
     auto enqueue_result = EnqueueTensorAllreduces(
-        hvd_contexts, hvd_tensors, hvd_outputs, ready_events, names, device,
+        hvd_contexts, hvd_tensors, hvd_outputs, ready_event_lists, names, device,
         callbacks, reduce_op, (double) prescale_factor_, (double) postscale_factor_);
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
   }
@@ -592,12 +659,25 @@ public:
     // ReadyEvent makes sure input tensor is ready.  We cannot pre-allocate
     // output for allgather, since shape of result is only known after all
     // ranks make a request.
-    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto enqueue_result = EnqueueTensorAllgather(
-        hvd_context, hvd_tensor, ready_event, node_name, device,
+        hvd_context, hvd_tensor, ready_event_list, node_name, device,
         [context, done](const common::Status& status) {
+#if HAVE_GPU
+          auto hvd_event = status.event;
+          if (hvd_event.event) {
+            auto device_context = context->op_device_context();
+            if (device_context != nullptr) {
+                auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+            }
+          }
+#endif
           context->SetStatus(ConvertStatus(status));
           done();
         });
@@ -669,7 +749,10 @@ public:
           context, context->allocate_output(0, tensor.shape(), &output), done);
     }
     // ReadyEvent makes sure input tensor is ready, and output is allocated.
-    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     std::shared_ptr<TFTensor> hvd_output = nullptr;
@@ -677,8 +760,18 @@ public:
       hvd_output = std::make_shared<TFTensor>(*output);
     }
     auto enqueue_result = EnqueueTensorBroadcast(
-        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event, node_name,
+        hvd_context, hvd_tensor, hvd_output, root_rank_, ready_event_list, node_name,
         device, [context, done](const common::Status& status) {
+#if HAVE_GPU
+          auto hvd_event = status.event;
+          if (hvd_event.event) {
+            auto device_context = context->op_device_context();
+            if (device_context != nullptr) {
+                auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+            }
+          }
+#endif
           context->SetStatus(ConvertStatus(status));
           done();
         });
@@ -730,12 +823,25 @@ public:
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
                          done);
     auto device = GetDeviceID(context);
-    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto enqueue_result = EnqueueJoin(
-      hvd_context, ready_event,
+      hvd_context, ready_event_list,
       JOIN_TENSOR_NAME, device,
         [context, done](const common::Status& status) {
+#if HAVE_GPU
+          auto hvd_event = status.event;
+          if (hvd_event.event) {
+            auto device_context = context->op_device_context();
+            if (device_context != nullptr) {
+                auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+            }
+          }
+#endif
           context->SetStatus(ConvertStatus(status));
           done();
         });
@@ -892,13 +998,26 @@ public:
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
     auto splits = context->input(1);
-    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    common::ReadyEventList ready_event_list;
+#if HAVE_GPU
+    ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
+#endif
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto splits_tensor = std::make_shared<TFTensor>(splits);
     auto enqueue_result = EnqueueTensorAlltoall(
-        hvd_context, hvd_tensor, splits_tensor, ready_event, node_name, device,
+        hvd_context, hvd_tensor, splits_tensor, ready_event_list, node_name, device,
         [context, done](const common::Status& status) {
+#if HAVE_GPU
+          auto hvd_event = status.event;
+          if (hvd_event.event) {
+            auto device_context = context->op_device_context();
+            if (device_context != nullptr) {
+                auto stream = stream_executor::gpu::AsGpuStreamValue(device_context->stream());
+                HVD_GPU_CHECK(gpuStreamWaitEvent(stream, *(hvd_event.event), 0));
+            }
+          }
+#endif
           context->SetStatus(ConvertStatus(status));
           done();
         });
