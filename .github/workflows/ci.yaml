@@ -1483,6 +1483,17 @@ jobs:
   docker-config:
     name: Configure docker build
     needs: [init-workflow, build-and-test-cpu, build-gpu, buildkite]
+    # build-and-test-cpu, build-gpu and buildkite might have been skipped (needs.init-workflow.outputs.run_builds_and_tests == 'false')
+    # buildkite might have been skipped (workflow runs for a fork PR)
+    # we still want to build docker images in these cases
+    if: >
+      always() &&
+      needs.init-workflow.result == 'success' && (
+        needs.init-workflow.outputs.run_builds_and_tests == 'false' ||
+        needs.build-and-test-cpu.result == 'success' &&
+        needs.build-gpu.result == 'success' &&
+        ( needs.buildkite.result == 'success' || needs.buildkite.result == 'skipped' )
+      )
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.config.outputs.run }}
@@ -1507,7 +1518,7 @@ jobs:
   docker-build:
     name: Build docker image ${{ matrix.docker-image }} (push=${{ needs.docker-config.outputs.push }})
     needs: docker-config
-    if: needs.docker-config.outputs.run == 'true'
+    if: always() && needs.docker-config.outputs.run == 'true'
     runs-on: ubuntu-latest
 
     # we want an ongoing run of this workflow to be canceled by a later commit

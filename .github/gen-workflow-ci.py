@@ -497,9 +497,22 @@ def main():
     def publish_docker_images(needs: List[str], images: List[str]) -> str:
         if 'init-workflow' not in needs:
             needs.insert(0, 'init-workflow')
+        if needs != ['init-workflow', 'build-and-test-cpu', 'build-gpu', 'buildkite']:
+            raise RuntimeError('This job has hard-coded needs, which you may want to adjust')
         return (f'  docker-config:\n'
                 f'    name: Configure docker build\n'
                 f'    needs: [{", ".join(needs)}]\n'
+                f"    # build-and-test-cpu, build-gpu and buildkite might have been skipped (needs.init-workflow.outputs.run_builds_and_tests == 'false')\n"
+                f'    # buildkite might have been skipped (workflow runs for a fork PR)\n'
+                f'    # we still want to build docker images in these cases\n'
+                f'    if: >\n'
+                f'      always() &&\n'
+                f"      needs.init-workflow.result == 'success' && (\n"
+                f"        needs.init-workflow.outputs.run_builds_and_tests == 'false' ||\n"
+                f"        needs.build-and-test-cpu.result == 'success' &&\n"
+                f"        needs.build-gpu.result == 'success' &&\n"
+                f"        ( needs.buildkite.result == 'success' || needs.buildkite.result == 'skipped' )\n"
+                f'      )\n'
                 f'    runs-on: ubuntu-latest\n'
                 f'    outputs:\n'
                 f'      run: ${{{{ steps.config.outputs.run }}}}\n'
@@ -524,7 +537,7 @@ def main():
                 f'  docker-build:\n'
                 f'    name: Build docker image ${{{{ matrix.docker-image }}}} (push=${{{{ needs.docker-config.outputs.push }}}})\n'
                 f'    needs: docker-config\n'
-                f'    if: needs.docker-config.outputs.run == \'true\'\n'
+                f'    if: always() && needs.docker-config.outputs.run == \'true\'\n'
                 f'    runs-on: ubuntu-latest\n'
                 f'\n'
                 f'    # we want an ongoing run of this workflow to be canceled by a later commit\n'
