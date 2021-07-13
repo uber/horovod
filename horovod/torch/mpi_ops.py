@@ -23,6 +23,7 @@ import warnings
 from horovod.common.basics import HorovodBasics as _HorovodBasics
 from horovod.common.exceptions import HorovodInternalError
 from horovod.common.process_sets import _setup as _setup_process_sets
+from horovod.common.process_sets import ProcessSet, global_process_set, add_process_set, remove_process_set
 from horovod.common.util import check_installed_version, get_average_backwards_compatibility_fun, gpu_available, num_rank_is_power_2
 
 from horovod.torch.compression import Compression
@@ -50,6 +51,7 @@ cross_size = _basics.cross_size
 rank = _basics.rank
 local_rank = _basics.local_rank
 cross_rank = _basics.cross_rank
+_process_set_rank = _basics._process_set_rank
 mpi_threads_supported = _basics.mpi_threads_supported
 mpi_enabled = _basics.mpi_enabled
 mpi_built = _basics.mpi_built
@@ -95,7 +97,7 @@ def _allreduce_function_factory(tensor):
     return 'horovod_torch_allreduce_async_' + tensor.type().replace('.', '_')
 
 
-def _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor):
+def _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor, process_set: ProcessSet):
     # Set the divisor for reduced gradients to average when necessary
     if op == Average:
         if rocm_built():
@@ -106,6 +108,8 @@ def _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor
             divisor = 1
 
     elif op == Adasum:
+        if process_set != global_process_set:
+            raise NotImplementedError("Adasum does not support non-global process sets yet.")
         if tensor.device.type != 'cpu' and gpu_available('torch'):
             if nccl_built():
                 if not is_homogeneous():
@@ -133,7 +137,7 @@ def _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor
     try:
         handle = getattr(mpi_lib, function)(tensor, output, divisor,
                                             name.encode() if name is not None else _NULL, op,
-                                            prescale_factor, postscale_factor)
+                                            prescale_factor, postscale_factor, process_set.process_set_id)
     except RuntimeError as e:
         raise HorovodInternalError(e)
     _handle_map[handle] = (tensor, output)
@@ -141,7 +145,8 @@ def _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor
 
 
 def allreduce_async(tensor, average=None, name=None, op=None,
-                    prescale_factor=1.0, postscale_factor=1.0):
+                    prescale_factor=1.0, postscale_factor=1.0,
+                    process_set=global_process_set):
     """
     A function that performs asynchronous averaging or summation of the input tensor
     over all the Horovod processes. The input tensor is not modified.
@@ -163,6 +168,8 @@ def allreduce_async(tensor, average=None, name=None, op=None,
                    ranks. Defaults to Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the allreduce operation that can be used with `poll()` or
@@ -170,30 +177,32 @@ def allreduce_async(tensor, average=None, name=None, op=None,
     """
     op = handle_average_backwards_compatibility(op, average)
     output = tensor.new(tensor.shape)
-    return _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor)
+    return _allreduce_async(tensor, output, name, op, prescale_factor, postscale_factor, process_set)
 
 
 class HorovodAllreduce(torch.autograd.Function):
     """An autograd function that performs allreduce on a tensor."""
 
     @staticmethod
-    def forward(ctx, tensor, average, name, op, prescale_factor, postscale_factor):
+    def forward(ctx, tensor, average, name, op, prescale_factor, postscale_factor, process_set):
         ctx.average = average
         ctx.op = op
         ctx.prescale_factor = prescale_factor
         ctx.postscale_factor = postscale_factor
-        handle = allreduce_async(tensor, average, name, op, prescale_factor, postscale_factor)
+        ctx.process_set = process_set
+        handle = allreduce_async(tensor, average, name, op, prescale_factor, postscale_factor, process_set)
         return synchronize(handle)
 
     @staticmethod
     def backward(ctx, grad_output):
         return allreduce(grad_output, average=ctx.average, op=ctx.op,
                          prescale_factor=ctx.prescale_factor,
-                         postscale_factor=ctx.postscale_factor), None, None, None, None, None
+                         postscale_factor=ctx.postscale_factor,
+                         process_set=ctx.process_set), None, None, None, None, None, None
 
 
 def allreduce(tensor, average=None, name=None, compression=Compression.none, op=None,
-              prescale_factor=1.0, postscale_factor=1.0):
+              prescale_factor=1.0, postscale_factor=1.0, process_set=global_process_set):
     """
     A function that performs averaging or summation of the input tensor over all the
     Horovod processes. The input tensor is not modified.
@@ -222,6 +231,8 @@ def allreduce(tensor, average=None, name=None, compression=Compression.none, op=
             to Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed across all
@@ -229,12 +240,14 @@ def allreduce(tensor, average=None, name=None, compression=Compression.none, op=
     """
     tensor_compressed, ctx = compression.compress(tensor)
     summed_tensor_compressed = HorovodAllreduce.apply(tensor_compressed, average, name, op,
-                                                      prescale_factor, postscale_factor)
+                                                      prescale_factor, postscale_factor,
+                                                      process_set)
     return compression.decompress(summed_tensor_compressed, ctx)
 
 
 def allreduce_async_(tensor, average=None, name=None, op=None,
-                     prescale_factor=1.0, postscale_factor=1.0):
+                     prescale_factor=1.0, postscale_factor=1.0,
+                     process_set=global_process_set):
     """
     A function that performs asynchronous in-place averaging or summation of the input
     tensor over all the Horovod processes.
@@ -256,17 +269,20 @@ def allreduce_async_(tensor, average=None, name=None, op=None,
             Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the allreduce operation that can be used with `poll()` or
         `synchronize()`.
     """
     op = handle_average_backwards_compatibility(op, average)
-    return _allreduce_async(tensor, tensor, name, op, prescale_factor, postscale_factor)
+    return _allreduce_async(tensor, tensor, name, op, prescale_factor, postscale_factor, process_set)
 
 
 def allreduce_(tensor, average=None, name=None, op=None,
-               prescale_factor=1.0, postscale_factor=1.0):
+               prescale_factor=1.0, postscale_factor=1.0,
+               process_set=global_process_set):
     """
     A function that performs in-place averaging or summation of the input tensor over
     all the Horovod processes.
@@ -288,12 +304,14 @@ def allreduce_(tensor, average=None, name=None, op=None,
             Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed across all
         processes.
     """
-    handle = allreduce_async_(tensor, average, name, op, prescale_factor, postscale_factor)
+    handle = allreduce_async_(tensor, average, name, op, prescale_factor, postscale_factor, process_set)
     return synchronize(handle)
 
 
@@ -301,7 +319,7 @@ def _grouped_allreduce_function_factory(tensor):
     return 'horovod_torch_grouped_allreduce_async_' + tensor.type().replace('.', '_')
 
 
-def _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postscale_factor):
+def _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postscale_factor, process_set: ProcessSet):
     # Set the divisor for reduced gradients to average when necessary
     if op == Average:
         if rocm_built():
@@ -311,6 +329,8 @@ def _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postsc
         else:
             divisor = 1
     elif op == Adasum:
+        if process_set != global_process_set:
+            raise NotImplementedError("Adasum does not support non-global process sets yet.")
         if tensors[0].device.type != 'cpu' and gpu_available('torch'):
             if nccl_built():
                 if not is_homogeneous():
@@ -338,7 +358,7 @@ def _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postsc
     try:
         handle = getattr(mpi_lib, function)(tensors, outputs, divisor,
                                             name.encode() if name is not None else _NULL, op,
-                                            prescale_factor, postscale_factor)
+                                            prescale_factor, postscale_factor, process_set.process_set_id)
     except RuntimeError as e:
         raise HorovodInternalError(e)
     _handle_map[handle] = (tuple(tensors), tuple(outputs))
@@ -346,7 +366,8 @@ def _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postsc
 
 
 def grouped_allreduce_async(tensors, average=None, name=None, op=None,
-                            prescale_factor=1.0, postscale_factor=1.0):
+                            prescale_factor=1.0, postscale_factor=1.0,
+                            process_set=global_process_set):
     """
     A function that performs asynchronous averaging or summation of the input tensor
     list over all the Horovod processes. The input tensors are not modified.
@@ -370,6 +391,8 @@ def grouped_allreduce_async(tensors, average=None, name=None, op=None,
                    ranks. Defaults to Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the group allreduce operation that can be used with `poll()` or
@@ -377,31 +400,34 @@ def grouped_allreduce_async(tensors, average=None, name=None, op=None,
     """
     op = handle_average_backwards_compatibility(op, average)
     outputs = [t.new(t.shape) for t in tensors]
-    return _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postscale_factor)
+    return _grouped_allreduce_async(tensors, outputs, name, op, prescale_factor, postscale_factor, process_set)
 
 
 class HorovodGroupedAllreduce(torch.autograd.Function):
     """An autograd function that performs allreduce on a list of tensors."""
 
     @staticmethod
-    def forward(ctx, average, name, op, prescale_factor, postscale_factor, *tensors):
+    def forward(ctx, average, name, op, prescale_factor, postscale_factor, process_set: ProcessSet, *tensors):
         ctx.average = average
         ctx.op = op
         ctx.prescale_factor = prescale_factor
         ctx.postscale_factor = postscale_factor
-        handle = grouped_allreduce_async(list(tensors), average, name, op, prescale_factor, postscale_factor)
+        ctx.process_set = process_set
+        handle = grouped_allreduce_async(list(tensors), average, name, op, prescale_factor, postscale_factor,
+                                         process_set)
         return synchronize(handle)
 
     @staticmethod
     def backward(ctx, *grad_output):
         grad_reduced = grouped_allreduce(list(grad_output), average=ctx.average, op=ctx.op,
                                          prescale_factor=ctx.prescale_factor,
-                                         postscale_factor=ctx.postscale_factor)
-        return (None, None, None, None, None, *grad_reduced)
+                                         postscale_factor=ctx.postscale_factor,
+                                         process_set=ctx.process_set)
+        return (None, None, None, None, None, None, *grad_reduced)
 
 
 def grouped_allreduce(tensors, average=None, name=None, compression=Compression.none, op=None,
-                      prescale_factor=1.0, postscale_factor=1.0):
+                      prescale_factor=1.0, postscale_factor=1.0, process_set=global_process_set):
     """
     A function that performs averaging or summation of the input tensor
     list over all the Horovod processes. The input tensors are not modified.
@@ -432,6 +458,8 @@ def grouped_allreduce(tensors, average=None, name=None, compression=Compression.
             to Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A list containing tensors of the same shape and type as in `tensors`,
@@ -440,12 +468,13 @@ def grouped_allreduce(tensors, average=None, name=None, compression=Compression.
     tensors_compressed, ctxs = zip(*[compression.compress(t) for t in tensors])
     summed_tensors_compressed = HorovodGroupedAllreduce.apply(average, name, op,
                                                               prescale_factor, postscale_factor,
-                                                              *tensors_compressed)
+                                                              process_set, *tensors_compressed)
     return [compression.decompress(t, ctx) for t, ctx in zip(summed_tensors_compressed, ctxs)]
 
 
 def grouped_allreduce_async_(tensors, average=None, name=None, op=None,
-                             prescale_factor=1.0, postscale_factor=1.0):
+                             prescale_factor=1.0, postscale_factor=1.0,
+                             process_set=global_process_set):
     """
     A function that performs asynchronous in-place averaging or summation of the input
     tensors over all the Horovod processes.
@@ -469,17 +498,20 @@ def grouped_allreduce_async_(tensors, average=None, name=None, op=None,
             Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the group allreduce operation that can be used with `poll()` or
         `synchronize()`.
     """
     op = handle_average_backwards_compatibility(op, average)
-    return _grouped_allreduce_async(tensors, tensors, name, op, prescale_factor, postscale_factor)
+    return _grouped_allreduce_async(tensors, tensors, name, op, prescale_factor, postscale_factor, process_set)
 
 
 def grouped_allreduce_(tensors, average=None, name=None, op=None,
-                       prescale_factor=1.0, postscale_factor=1.0):
+                       prescale_factor=1.0, postscale_factor=1.0,
+                       process_set=global_process_set):
     """
     A function that performs in-place averaging or summation of the input tensors over
     all the Horovod processes.
@@ -503,22 +535,25 @@ def grouped_allreduce_(tensors, average=None, name=None, op=None,
             Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A list containing tensors of the same shape and type as in `tensors`,
         averaged or summed across all processes.
     """
-    handle = grouped_allreduce_async_(tensors, average, name, op, prescale_factor, postscale_factor)
+    handle = grouped_allreduce_async_(tensors, average, name, op, prescale_factor, postscale_factor, process_set)
     return synchronize(handle)
 
 
-def sparse_allreduce_async(tensor, name, op):
+def sparse_allreduce_async(tensor, name, op, process_set=global_process_set):
     # Allgather aggregates along the first dimension, so we need to transpose the
     # indices to enforce correct concatenation behavior, then transpose back prior to
     # constructing the new aggregated sparse gradient
     t = tensor
-    indices_handle = allgather_async(t._indices().transpose(0, 1).contiguous(), name=f'{name}.indices')
-    values_handle = allgather_async(t._values(), name=f'{name}.values')
+    indices_handle = allgather_async(t._indices().transpose(0, 1).contiguous(), name=f'{name}.indices',
+                                     process_set=process_set)
+    values_handle = allgather_async(t._values(), name=f'{name}.values', process_set=process_set)
 
     def handle():
         # We need to sync values handle firstly for torch nightly >= 10.0
@@ -526,7 +561,7 @@ def sparse_allreduce_async(tensor, name, op):
         values = synchronize(values_handle)
         indices = synchronize(indices_handle)
 
-        values = (values / size()) if op == Average else values
+        values = (values / process_set.size()) if op == Average else values
 
         if indices.dim() == 0 or values.dim() == 0:
             return t.new().resize_as_(t)
@@ -539,18 +574,19 @@ def _allgather_function_factory(tensor):
     return 'horovod_torch_allgather_async_' + tensor.type().replace('.', '_')
 
 
-def _allgather_async(tensor, output, name):
+def _allgather_async(tensor, output, name, process_set: ProcessSet):
     function = _check_function(_allgather_function_factory, tensor)
     try:
         handle = getattr(mpi_lib, function)(
-            tensor, output, name.encode() if name is not None else _NULL)
+            tensor, output, name.encode() if name is not None else _NULL,
+            process_set.process_set_id)
     except RuntimeError as e:
         raise HorovodInternalError(e)
     _handle_map[handle] = (tensor, output)
     return handle
 
 
-def allgather_async(tensor, name=None):
+def allgather_async(tensor, name=None, process_set=global_process_set):
     """
     A function that asynchronously concatenates the input tensor with the same input
     tensor on all other Horovod processes. The input tensor is not modified.
@@ -562,37 +598,40 @@ def allgather_async(tensor, name=None):
     Arguments:
         tensor: A tensor to allgather.
         name: A name of the allgather operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the allgather operation that can be used with `poll()` or
         `synchronize()`.
     """
     output = tensor.new()
-    return _allgather_async(tensor, output, name)
+    return _allgather_async(tensor, output, name, process_set)
 
 
 class HorovodAllgather(torch.autograd.Function):
     """An autograd function that performs allgather on a tensor."""
 
     @staticmethod
-    def forward(ctx, tensor, name):
+    def forward(ctx, tensor, name, process_set: ProcessSet):
         ctx.dim = tensor.shape[0]
-        handle = allgather_async(tensor, name)
+        ctx.process_set = process_set
+        handle = allgather_async(tensor, name, process_set)
         return synchronize(handle)
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_reduced = allreduce(grad_output, average=True)
+        grad_reduced = allreduce(grad_output, average=True, process_set=ctx.process_set)
 
         dim_t = torch.IntTensor([ctx.dim])
-        dim = allgather(dim_t).view(size())
+        dim = allgather(dim_t, process_set=ctx.process_set).view(ctx.process_set.size())
 
-        r = rank()
+        r = _process_set_rank(ctx.process_set.process_set_id)
         offset = torch.sum(dim.narrow(0, 0, r)).item() if r != 0 else 0
-        return grad_reduced.narrow(0, offset, ctx.dim), None
+        return grad_reduced.narrow(0, offset, ctx.dim), None, None
 
 
-def allgather(tensor, name=None):
+def allgather(tensor, name=None, process_set=global_process_set):
     """
     A function that concatenates the input tensor with the same input tensor on
     all other Horovod processes. The input tensor is not modified.
@@ -608,6 +647,8 @@ def allgather(tensor, name=None):
     Arguments:
         tensor: A tensor to allgather.
         name: A name of the allgather operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A tensor of the same type as `tensor`, concatenated on dimension zero
@@ -615,25 +656,26 @@ def allgather(tensor, name=None):
         the first dimension, which may be greater and is the sum of all first
         dimensions of the tensors in different Horovod processes.
     """
-    return HorovodAllgather.apply(tensor, name)
+    return HorovodAllgather.apply(tensor, name, process_set)
 
 
 def _broadcast_function_factory(tensor):
     return 'horovod_torch_broadcast_async_' + tensor.type().replace('.', '_')
 
 
-def _broadcast_async(tensor, output, root_rank, name):
+def _broadcast_async(tensor, output, root_rank, name, process_set: ProcessSet):
     function = _check_function(_broadcast_function_factory, tensor)
     try:
         handle = getattr(mpi_lib, function)(
-            tensor, output, root_rank, name.encode() if name is not None else _NULL)
+            tensor, output, root_rank, name.encode() if name is not None else _NULL,
+            process_set.process_set_id)
     except RuntimeError as e:
         raise HorovodInternalError(e)
     _handle_map[handle] = (tensor, output)
     return handle
 
 
-def broadcast_async(tensor, root_rank, name=None):
+def broadcast_async(tensor, root_rank, name=None, process_set=global_process_set):
     """
     A function that asynchronously broadcasts the input tensor on root rank to the same
     input tensor on all other Horovod processes. The input tensor is not modified.
@@ -647,33 +689,36 @@ def broadcast_async(tensor, root_rank, name=None):
         tensor: A tensor to broadcast.
         root_rank: The rank to broadcast the value from.
         name: A name of the broadcast operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the broadcast operation that can be used with `poll()` or
         `synchronize()`.
     """
     output = tensor.new(tensor.shape)
-    return _broadcast_async(tensor, output, root_rank, name)
+    return _broadcast_async(tensor, output, root_rank, name, process_set)
 
 
 class HorovodBroadcast(torch.autograd.Function):
     """An autograd function that broadcasts a tensor."""
 
     @staticmethod
-    def forward(ctx, tensor, root_rank, name):
+    def forward(ctx, tensor, root_rank, name, process_set: ProcessSet):
         ctx.root_rank = root_rank
-        handle = broadcast_async(tensor, root_rank, name)
+        ctx.process_set = process_set
+        handle = broadcast_async(tensor, root_rank, name, process_set)
         return synchronize(handle)
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_reduced = allreduce(grad_output, average=True)
+        grad_reduced = allreduce(grad_output, average=True, process_set=ctx.process_set)
         if rank() != ctx.root_rank:
             grad_reduced *= 0
-        return grad_reduced, None, None
+        return grad_reduced, None, None, None
 
 
-def broadcast(tensor, root_rank, name=None):
+def broadcast(tensor, root_rank, name=None, process_set=global_process_set):
     """
     A function that broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes. The input tensor is not modified.
@@ -691,15 +736,17 @@ def broadcast(tensor, root_rank, name=None):
         tensor: A tensor to broadcast.
         root_rank: The rank to broadcast the value from.
         name: A name of the broadcast operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A tensor of the same shape and type as `tensor`, with the value broadcasted
         from root rank.
     """
-    return HorovodBroadcast.apply(tensor, root_rank, name)
+    return HorovodBroadcast.apply(tensor, root_rank, name, process_set)
 
 
-def broadcast_async_(tensor, root_rank, name=None):
+def broadcast_async_(tensor, root_rank, name=None, process_set=global_process_set):
     """
     A function that asynchronously broadcasts the input tensor on root rank to the same
     input tensor on all other Horovod processes. The operation is performed in-place.
@@ -713,15 +760,17 @@ def broadcast_async_(tensor, root_rank, name=None):
         tensor: A tensor to broadcast.
         root_rank: The rank to broadcast the value from.
         name: A name of the broadcast operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the broadcast operation that can be used with `poll()` or
         `synchronize()`.
     """
-    return _broadcast_async(tensor, tensor, root_rank, name)
+    return _broadcast_async(tensor, tensor, root_rank, name, process_set)
 
 
-def broadcast_(tensor, root_rank, name=None):
+def broadcast_(tensor, root_rank, name=None, process_set=global_process_set):
     """
     A function that broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes. The operation is performed in-place.
@@ -735,18 +784,20 @@ def broadcast_(tensor, root_rank, name=None):
         tensor: A tensor to broadcast.
         root_rank: The rank to broadcast the value from.
         name: A name of the broadcast operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         A tensor of the same shape and type as `tensor`, with the value broadcasted
         from root rank.
     """
-    handle = broadcast_async_(tensor, root_rank, name)
+    handle = broadcast_async_(tensor, root_rank, name, process_set)
     return synchronize(handle)
 
 def _alltoall_function_factory(tensor):
     return 'horovod_torch_alltoall_async_' + tensor.type().replace('.', '_')
 
-def _alltoall_async(tensor, splits, output, output_received_splits, name):
+def _alltoall_async(tensor, splits, output, output_received_splits, name, process_set: ProcessSet):
     if splits is None:
         # If splits not provided, create empty tensor as placeholder
         splits = torch.tensor([], dtype=torch.int32, device='cpu')
@@ -755,14 +806,15 @@ def _alltoall_async(tensor, splits, output, output_received_splits, name):
     function = _check_function(_alltoall_function_factory, tensor)
     try:
         handle = getattr(mpi_lib, function)(
-            tensor, splits, output, output_received_splits, name.encode() if name is not None else _NULL)
+            tensor, splits, output, output_received_splits, name.encode() if name is not None else _NULL,
+            process_set.process_set_id)
     except RuntimeError as e:
         raise HorovodInternalError(e)
     _handle_map[handle] = (tensor, splits, (output, output_received_splits))
     return handle
 
 
-def alltoall_async(tensor, splits=None, name=None):
+def alltoall_async(tensor, splits=None, name=None, process_set=global_process_set):
     """
     A function that scatters slices of the input tensor to all other Horovod processes
     and returns a tensor of gathered slices from all other Horovod processes. The input
@@ -780,6 +832,8 @@ def alltoall_async(tensor, splits=None, name=None):
                 not provided, the first dimension is split equally by the
                 number of Horovod processes.
         name: A name of the alltoall operation.
+        process_set: Process set object to limit this operation to a subset of
+                Horovod processes. Default is the global process set.
 
     Returns:
         A handle to the alltoall operation that can be used with `poll()` or
@@ -790,17 +844,18 @@ def alltoall_async(tensor, splits=None, name=None):
         output_received_splits = splits.new()
     else:
         output_received_splits = torch.empty(size(), dtype=torch.int32, device='cpu')
-    return _alltoall_async(tensor, splits, output, output_received_splits, name)
+    return _alltoall_async(tensor, splits, output, output_received_splits, name, process_set)
 
 
 class HorovodAlltoall(torch.autograd.Function):
     """An autograd function that performs alltoall on a tensor."""
 
     @staticmethod
-    def forward(ctx, tensor, splits, name):
-        handle = alltoall_async(tensor, splits, name)
+    def forward(ctx, tensor, splits, name, process_set: ProcessSet):
+        handle = alltoall_async(tensor, splits, name, process_set)
         output, received_splits = synchronize(handle)
 
+        ctx.process_set = process_set
         ctx.recvsplits = received_splits
         if splits is None:
             return output
@@ -810,11 +865,12 @@ class HorovodAlltoall(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, *dead_gradients):
-        grad_wrt_tensor, _ = alltoall(grad_output, splits=ctx.recvsplits)
-        return grad_wrt_tensor, None, None
+        grad_wrt_tensor, _ = alltoall(grad_output, splits=ctx.recvsplits,
+                                      process_set=ctx.process_set)
+        return grad_wrt_tensor, None, None, None
 
 
-def alltoall(tensor, splits=None, name=None):
+def alltoall(tensor, splits=None, name=None, process_set=global_process_set):
     """
     A function that scatters slices of the input tensor to all other Horovod processes
     and returns a tensor of gathered slices from all other Horovod processes. The input
@@ -836,6 +892,8 @@ def alltoall(tensor, splits=None, name=None):
                 not provided, the first dimension is split equally by the
                 number of Horovod processes.
         name: A name of the alltoall operation.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
 
     Returns:
         1) A tensor containing the gathered tensor data from all workers.
@@ -843,7 +901,7 @@ def alltoall(tensor, splits=None, name=None):
            describing how many elements in the output tensor have been received
            from each worker.
      """
-    return HorovodAlltoall.apply(tensor, splits, name)
+    return HorovodAlltoall.apply(tensor, splits, name, process_set)
 
 
 def poll(handle):
