@@ -44,7 +44,7 @@ if args.cuda:
 cudnn.benchmark = True
 
 # Set up standard model.
-model = getattr(models, args.model)()
+model = getattr(models, args.model)(norm_layer=hvd.SyncBatchNorm)
 
 # By default, Adasum doesn't need scaling up learning rate.
 lr_scaler = hvd.size() if not args.use_adasum else 1

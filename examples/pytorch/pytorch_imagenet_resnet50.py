@@ -247,7 +247,7 @@ if __name__ == '__main__':
 
 
     # Set up standard ResNet-50 model.
-    model = models.resnet50()
+    model = models.resnet50(norm_layer=hvd.SyncBatchNorm)
 
     # By default, Adasum doesn't need scaling up learning rate.
     # For sum/average with gradient Accumulation: scale learning rate by batches_per_allreduce
