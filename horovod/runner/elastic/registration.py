@@ -38,6 +38,8 @@ class WorkerStateRegistry(object):
         self._rendezvous_id = 0
         self._verbose = verbose
         self._size = 0
+        self._action_event = threading.Event()
+        self._action_event.set()
 
     def get_recorded_slots(self):
         return self._states.keys()
@@ -80,6 +82,9 @@ class WorkerStateRegistry(object):
         if self._host_manager.is_blacklisted(host):
             logging.warning('host registers state %s but is already blacklisted, ignoring: %s', state, host)
             return self._rendezvous_id
+
+        # we should wait for _action finished if a _record_state called when _action is running
+        self._action_event.wait()
 
         key = (host, slot)
         with self._lock:
@@ -130,7 +135,9 @@ class WorkerStateRegistry(object):
                         raise RuntimeError('State {} overridden by {}'.format(state, saved_state))
 
     def _action(self):
+        self._action_event.clear()
         self._on_workers_recorded()
+        self._action_event.set()
 
     def _on_workers_recorded(self):
         logging.info('all {} workers recorded'.format(self.size()))
