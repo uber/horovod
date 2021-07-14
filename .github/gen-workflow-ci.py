@@ -327,8 +327,11 @@ def main():
                 f'          steps.ecr.outcome == \'success\'\n'
                 f'        continue-on-error: true\n'
                 f'        run: |\n'
-                f'          docker tag ${{{{ matrix.image }}}} ${{{{ steps.ecr.outputs.registry }}}}:horovod-${{{{ matrix.image }}}}-latest\n'
-                f'          docker push ${{{{ steps.ecr.outputs.registry }}}}:horovod-${{{{ matrix.image }}}}-latest\n')
+                f'          docker image ls | head\n'
+                f'          docker tag horovod_${{{{ matrix.image }}}} ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
+                f'          docker push ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
+                f'          docker image ls | head\n'
+                f'        shell: bash\n')
 
     def build_and_test_macos(id: str, name: str, needs: List[str]) -> str:
         if 'init-workflow' not in needs:

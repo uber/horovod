@@ -83,24 +83,6 @@ build_test() {
   echo "    queue: cpu"
 }
 
-cache_test() {
-  local test=$1
-
-  echo "- label: ':docker: Update ${BUILDKITE_PIPELINE_SLUG}-${test}-latest'"
-  echo "  plugins:"
-  echo "  - docker-compose#v3.5.0:"
-  echo "      push: ${test}:${repository}:${BUILDKITE_PIPELINE_SLUG}-${test}-latest"
-  echo "      config: docker-compose.test.yml"
-  echo "      push-retries: 3"
-  echo "  - ecr#v1.2.0:"
-  echo "      login: true"
-  echo "  timeout_in_minutes: 5"
-  echo "  retry:"
-  echo "    automatic: true"
-  echo "  agents:"
-  echo "    queue: cpu"
-}
-
 run_test() {
   local test=$1
   local queue=$2
@@ -415,13 +397,6 @@ done
 
 # wait for all builds to finish
 echo "- wait"
-
-# cache test containers if built from master
-if [[ "${BUILDKITE_BRANCH}" == "master" ]]; then
-  for test in ${tests[@]-}; do
-    cache_test "${test}"
-  done
-fi
 
 oneccl_env="\\\$(cat:/oneccl_env):&&"
 oneccl_cmd_ofi="${oneccl_env}:echo:'/mpirun_command_ofi':>:/mpirun_command:&&"

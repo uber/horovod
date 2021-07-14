@@ -1721,8 +1721,11 @@ jobs:
           steps.ecr.outcome == 'success'
         continue-on-error: true
         run: |
-          docker tag ${{ matrix.image }} ${{ steps.ecr.outputs.registry }}:horovod-${{ matrix.image }}-latest
-          docker push ${{ steps.ecr.outputs.registry }}:horovod-${{ matrix.image }}-latest
+          docker image ls | head
+          docker tag horovod_${{ matrix.image }} ${{ steps.ecr.outputs.registry }}/buildkite:horovod-${{ matrix.image }}-latest
+          docker push ${{ steps.ecr.outputs.registry }}/buildkite:horovod-${{ matrix.image }}-latest
+          docker image ls | head
+        shell: bash
 
   build-and-test-heads:
     name: "Build and Test heads (${{ matrix.image }})"
@@ -3237,8 +3240,11 @@ jobs:
           steps.ecr.outcome == 'success'
         continue-on-error: true
         run: |
-          docker tag ${{ matrix.image }} ${{ steps.ecr.outputs.registry }}:horovod-${{ matrix.image }}-latest
-          docker push ${{ steps.ecr.outputs.registry }}:horovod-${{ matrix.image }}-latest
+          docker image ls | head
+          docker tag horovod_${{ matrix.image }} ${{ steps.ecr.outputs.registry }}/buildkite:horovod-${{ matrix.image }}-latest
+          docker push ${{ steps.ecr.outputs.registry }}/buildkite:horovod-${{ matrix.image }}-latest
+          docker image ls | head
+        shell: bash
 
   build-and-test-macos:
     name: "Build and Test macOS (${{ matrix.image }}-macos)"
