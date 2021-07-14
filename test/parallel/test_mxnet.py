@@ -532,7 +532,7 @@ class MXTests(unittest.TestCase):
             self.skipTest("Only one worker available")
 
         dtypes = ['int32',   'int64',
-                  'float32', 'float64'] 
+                  'float32', 'float64']
         dims = [1, 2, 3]
         ctx = self._current_context()
         count = 0
@@ -577,7 +577,7 @@ class MXTests(unittest.TestCase):
             self.skipTest("Only one worker available")
 
         dtypes = ['int32',   'int64',
-                  'float32', 'float64'] 
+                  'float32', 'float64']
         dims = [1, 2, 3]
         ctx = self._current_context()
         count = 0
@@ -624,7 +624,7 @@ class MXTests(unittest.TestCase):
             self.skipTest("Only one worker available")
 
         dtypes = ['int32',   'int64',
-                  'float32', 'float64'] 
+                  'float32', 'float64']
         dims = [1, 2, 3]
         ctx = self._current_context()
         count = 0
@@ -1141,12 +1141,10 @@ class MXTests(unittest.TestCase):
 
             def hybrid_forward(self, F, data):
                 """
-
                 Parameters
                 ----------
                 data :
                     Shape (batch_size, seq_len, fea_dim)
-
                 Returns
                 -------
                 out :
