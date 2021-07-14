@@ -733,7 +733,12 @@ class MXTests(unittest.TestCase):
         layer.initialize()
         hvd.broadcast_parameters(layer.collect_params(), root_rank=root_rank)
 
-        x = mx.nd.ones((5, 4, 10, 10))
+        # MXNet 2.0 Gluon requires this to be mx.np rather than mx.nd
+        # https://github.com/apache/incubator-mxnet/issues/20442
+        if LooseVersion(mx.__version__) < LooseVersion('2.0.0'):
+            x = mx.nd.ones((5, 4, 10, 10))
+        else:
+            x = mx.np.ones((5, 4, 10, 10))
         layer(x)
         tensors = [p.data() for _, p in sorted(layer.collect_params().items())]
         root_tensors = []
@@ -1070,14 +1075,22 @@ class MXTests(unittest.TestCase):
         trainer2 = hvd.DistributedTrainer(params2, 'sgd', {'learning_rate': 0.1}, prefix="net2")
 
         for i in range(10):
-            data = mx.nd.ones((5, 10), ctx=ctx)
+            # MXNet 2.0 Gluon requires this to be mx.np rather than mx.nd
+            # https://github.com/apache/incubator-mxnet/issues/20442
+            if LooseVersion(mx.__version__) < LooseVersion('2.0.0'):
+                data = mx.nd.ones((5, 10), ctx=ctx)
+            else:
+                data = mx.np.ones((5, 10), ctx=ctx)
             with mx.autograd.record():
                 pred1 = net1(data).sum()
                 pred2 = net2(data).sum()
             mx.autograd.backward([pred1, pred2])
             trainer1.step(1.0)
             trainer2.step(1.0)
-            l = pred1.asscalar() + pred2.asscalar()
+            if LooseVersion(mx.__version__) < LooseVersion('2.0.0'):
+                l = pred1.asscalar() + pred2.asscalar()
+            else:
+                l = pred1.item() + pred2.item()
 
     def test_horovod_alltoall_rank_error(self):
         """Test that the alltoall returns an error if any dimension besides
