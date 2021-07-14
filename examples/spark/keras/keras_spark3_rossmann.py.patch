@@ -17,13 +17,16 @@
 >     # Cluster for GPU inference.
 >     GPU_INFERENCE_CLUSTER = 'local-cluster[2,1,1024]'  # or 'spark://hostname:7077'
 > 
-397a407
+396a406
 >         from horovod.spark.task import get_available_devices
-412c422
-<         config.gpu_options.visible_device_list = str(hvd.local_rank())
+410,411c420,422
+<         if gpus:
+<             gpu = gpus[hvd.local_rank()]
 ---
->         config.gpu_options.visible_device_list = get_available_devices()[0]
-495a506,530
+>         gpu_ids = get_available_devices()
+>         if gpus and gpu_ids:
+>             gpu = gpus[int(gpu_ids[0])]
+495a507,531
 >     def set_gpu_conf(conf):
 >         # This config will change depending on your cluster setup.
 >         #
@@ -49,9 +52,9 @@
 >         return conf
 > 
 > 
-499a535
+499a536
 >     conf = set_gpu_conf(conf)
-530,531c566,574
+530,531c567,575
 <     if args.processing_master:
 <         conf.setMaster(args.processing_master)
 ---
@@ -64,22 +67,22 @@
 >         if args.processing_master:
 >             conf.setMaster(args.processing_master)
 > 
-541,545c584,595
+542,545c586,598
 <             # Do not use GPUs for prediction, use single CPU core per task.
-<             config = tf.ConfigProto(device_count={'GPU': 0})
-<             config.inter_op_parallelism_threads = 1
-<             config.intra_op_parallelism_threads = 1
-<             K.set_session(tf.Session(config=config))
+<             tf.config.set_visible_devices([], 'GPU')
+<             tf.config.threading.set_inter_op_parallelism_threads(1)
+<             tf.config.threading.set_intra_op_parallelism_threads(1)
 ---
 >             if GPU_INFERENCE_ENABLED:
 >                 from pyspark import TaskContext
->                 config = tf.ConfigProto()
->                 config.gpu_options.allow_growth = True
->                 config.gpu_options.visible_device_list = TaskContext.get().resources()['gpu'].addresses[0]
->                 K.set_session(tf.Session(config=config))
+>                 gpus = tf.config.list_physical_devices('GPU')
+>                 gpu_id = TaskContext.get().resources()['gpu'].addresses[0]
+>                 if gpus:
+>                     gpu = gpus[int(gpu_id)]
+>                     tf.config.experimental.set_memory_growth(gpu, True)
+>                     tf.config.experimental.set_visible_devices(gpu, 'GPU')
 >             else:
 >                 # Do not use GPUs for prediction, use single CPU core per task.
->                 config = tf.ConfigProto(device_count={'GPU': 0})
->                 config.inter_op_parallelism_threads = 1
->                 config.intra_op_parallelism_threads = 1
->                 K.set_session(tf.Session(config=config))
+>                 tf.config.set_visible_devices([], 'GPU')
+>                 tf.config.threading.set_inter_op_parallelism_threads(1)
+>                 tf.config.threading.set_intra_op_parallelism_threads(1)

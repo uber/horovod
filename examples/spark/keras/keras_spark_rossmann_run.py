@@ -335,7 +335,7 @@ if __name__ == '__main__':
 
     def act_sigmoid_scaled(x):
         """Sigmoid scaled to logarithm of maximum sales scaled by 20%."""
-        return tf.nn.sigmoid(x) * tf.log(max_sales) * 1.2
+        return tf.nn.sigmoid(x) * tf.math.log(max_sales) * 1.2
 
 
     CUSTOM_OBJECTS = {'exp_rmspe': exp_rmspe,
@@ -345,7 +345,7 @@ if __name__ == '__main__':
     def serialize_model(model):
         """Serialize model into byte array."""
         bio = io.BytesIO()
-        with h5py.File(bio) as f:
+        with h5py.File(bio, 'w') as f:
             model.save(f)
         return bio.getvalue()
 
@@ -353,13 +353,12 @@ if __name__ == '__main__':
     def deserialize_model(model_bytes, load_model_fn):
         """Deserialize model from byte array."""
         bio = io.BytesIO(model_bytes)
-        with h5py.File(bio) as f:
+        with h5py.File(bio, 'r') as f:
             return load_model_fn(f, custom_objects=CUSTOM_OBJECTS)
 
 
     # Do not use GPU for the session creation.
-    config = tf.ConfigProto(device_count={'GPU': 0})
-    K.set_session(tf.Session(config=config))
+    tf.config.set_visible_devices([], 'GPU')
 
     # Build the model.
     inputs = {col: Input(shape=(1,), name=col) for col in all_cols}
@@ -380,7 +379,7 @@ if __name__ == '__main__':
     model.summary()
 
     # Horovod: add Distributed Optimizer.
-    opt = tf.keras.optimizers.Adam(lr=args.learning_rate, epsilon=1e-3)
+    opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate, epsilon=1e-3)
     opt = hvd.DistributedOptimizer(opt)
     model.compile(opt, 'mae', metrics=[exp_rmspe])
     model_bytes = serialize_model(model)
@@ -407,10 +406,11 @@ if __name__ == '__main__':
         hvd.init()
 
         # Horovod: pin GPU to be used to process local rank (one GPU per process), if GPUs are available.
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth = True
-        config.gpu_options.visible_device_list = str(hvd.local_rank())
-        K.set_session(tf.Session(config=config))
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            gpu = gpus[hvd.local_rank()]
+            tf.config.experimental.set_memory_growth(gpu, True)
+            tf.config.experimental.set_visible_devices(gpu, 'GPU')
 
         # Horovod: restore from checkpoint, use hvd.load_model under the hood.
         model = deserialize_model(model_bytes, hvd.load_model)
@@ -468,12 +468,12 @@ if __name__ == '__main__':
                     .apply(tf.data.experimental.unbatch()) \
                     .shuffle(int(train_rows / hvd.size())) \
                     .batch(args.batch_size) \
-                    .map(lambda x: (tuple(getattr(x, col) for col in all_cols), tf.log(x.Sales)))
+                    .map(lambda x: (tuple(getattr(x, col) for col in all_cols), tf.math.log(x.Sales)))
 
                 val_ds = make_petastorm_dataset(val_reader) \
                     .apply(tf.data.experimental.unbatch()) \
                     .batch(args.batch_size) \
-                    .map(lambda x: (tuple(getattr(x, col) for col in all_cols), tf.log(x.Sales)))
+                    .map(lambda x: (tuple(getattr(x, col) for col in all_cols), tf.math.log(x.Sales)))
 
                 history = model.fit(train_ds,
                                     validation_data=val_ds,
@@ -534,15 +534,15 @@ if __name__ == '__main__':
 
     def predict_fn(model_bytes):
         def fn(rows):
+            import numpy as np
             import math
             import tensorflow as tf
             import tensorflow.keras.backend as K
 
             # Do not use GPUs for prediction, use single CPU core per task.
-            config = tf.ConfigProto(device_count={'GPU': 0})
-            config.inter_op_parallelism_threads = 1
-            config.intra_op_parallelism_threads = 1
-            K.set_session(tf.Session(config=config))
+            tf.config.set_visible_devices([], 'GPU')
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+            tf.config.threading.set_intra_op_parallelism_threads(1)
 
             # Restore from checkpoint.
             model = deserialize_model(model_bytes, tf.keras.models.load_model)
@@ -551,7 +551,7 @@ if __name__ == '__main__':
             for row in rows:
                 fields = row.asDict().copy()
                 # Convert from log domain to real Sales numbers.
-                log_sales = model.predict_on_batch([[row[col]] for col in all_cols])[0]
+                log_sales = model.predict_on_batch([np.array([row[col]]) for col in all_cols])[0]
                 # Add 'Sales' column with prediction results.
                 fields['Sales'] = math.exp(log_sales)
                 yield Row(**fields)
