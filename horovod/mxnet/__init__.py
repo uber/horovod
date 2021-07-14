@@ -30,6 +30,7 @@ from horovod.mxnet.mpi_ops import size, local_size, cross_size, rank, local_rank
 from horovod.mxnet.mpi_ops import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.mxnet.mpi_ops import gloo_enabled, gloo_built
 from horovod.mxnet.mpi_ops import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
+from horovod.mxnet.mpi_ops import ProcessSet, global_process_set, add_process_set, remove_process_set
 
 import mxnet as mx
 from collections import OrderedDict, defaultdict
@@ -39,7 +40,7 @@ import warnings
 
 # This is where Horovod's DistributedOptimizer wrapper for MXNet goes
 class DistributedOptimizer(mx.optimizer.Optimizer):
-    def __init__(self, optimizer, gradient_predivide_factor=1.0, num_groups=0):
+    def __init__(self, optimizer, gradient_predivide_factor=1.0, num_groups=0, process_set=global_process_set):
         if gradient_predivide_factor != 1.0 and rocm_built():
             raise ValueError('gradient_predivide_factor not supported yet with ROCm')
 
@@ -49,9 +50,13 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._optimizer.rescale_grad *= (gradient_predivide_factor / size())
         self._gradient_predivide_factor = gradient_predivide_factor
         self._num_groups = num_groups
+        self._process_set = process_set
 
     def __getattr__(self, item):
         return getattr(self._optimizer, item)
+
+    def create_state(self, index, weight):
+        return self._optimizer.create_state(index, weight)
 
     def create_state_multi_precision(self, index, weight):
         return self._optimizer.create_state_multi_precision(index, weight)
@@ -66,22 +71,27 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
 
                 for i, (grads, indices) in enumerate(zip(grad_split, index_split)):
                     grouped_allreduce_(tensors=grads, average=False, name="{}:{}".format(indices[0], indices[-1]), priority=-i,
-                                       prescale_factor=1.0 / self._gradient_predivide_factor)
+                                       prescale_factor=1.0 / self._gradient_predivide_factor,
+                                       process_set=self._process_set)
             else:
               for i in range(len(index)):
                   allreduce_(grad[i], average=False,
                              name=str(index[i]), priority=-i,
-                             prescale_factor=1.0 / self._gradient_predivide_factor)
+                             prescale_factor=1.0 / self._gradient_predivide_factor,
+                             process_set=self._process_set)
         else:
             allreduce_(grad, average=False, name=str(index),
-                       prescale_factor=1.0 / self._gradient_predivide_factor)
+                       prescale_factor=1.0 / self._gradient_predivide_factor,
+                       process_set=self._process_set)
 
     def update(self, index, weight, grad, state):
-        self._do_allreduce(index, grad)
+        if self._process_set.included():
+            self._do_allreduce(index, grad)
         self._optimizer.update(index, weight, grad, state)
 
     def update_multi_precision(self, index, weight, grad, state):
-        self._do_allreduce(index, grad)
+        if self._process_set.included():
+            self._do_allreduce(index, grad)
         self._optimizer.update_multi_precision(index, weight, grad, state)
 
     def set_learning_rate(self, lr):

@@ -47,6 +47,9 @@ except ImportError:
     _skip_enqueue_errors = False
     HAS_MXNET = False
 
+# Set environment variable to enable adding/removing process sets after initializing Horovod.
+os.environ["HOROVOD_DYNAMIC_PROCESS_SETS"] = "1"
+
 
 @pytest.mark.skipif(not HAS_MXNET, reason='MXNet unavailable')
 class MXTests(unittest.TestCase):
@@ -311,6 +314,61 @@ class MXTests(unittest.TestCase):
         except (MXNetError, RuntimeError):
             pass
 
+    def test_horovod_allreduce_process_sets(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        shapes = [(), (17), (17, 17), (17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            even_rank_tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                                    ctx=ctx)
+            odd_rank_tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                                   ctx=ctx)
+            if rank in even_ranks:
+                tensor = even_rank_tensor.astype(dtype)
+                summed = hvd.allreduce(tensor, average=False, name=str(count), process_set=even_set)
+                multiplied = tensor * len(even_ranks)
+            elif rank in odd_ranks:
+                tensor = odd_rank_tensor.astype(dtype)
+                summed = hvd.allreduce(tensor, average=False, name=str(count), process_set=odd_set)
+                multiplied = tensor * len(odd_ranks)
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(summed.asnumpy(), multiplied.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
     def test_horovod_allreduce_type_error(self):
         """Test that the allreduce raises an error if different ranks try to
            send tensors of different type."""
@@ -503,6 +561,64 @@ class MXTests(unittest.TestCase):
                 for t1, t2 in zip(tensors, multiplied)]), \
                 f'hvd.grouped_allreduce_ produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
 
+    def test_horovod_grouped_allreduce_process_sets(self):
+        """Test that the grouped allreduce correctly sums 1D, 2D, 3D tensors if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+        
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 1
+        shapes = [(), (17), (17, 17), (17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+
+            even_rank_tensors = [mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                                      ctx=ctx) for _ in range(5)]
+            odd_rank_tensors = [mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                                     ctx=ctx) for _ in range(5)]
+
+            if rank in even_ranks:
+                tensors = [tensor.astype(dtype) for tensor in even_rank_tensors]
+                multiplied = [tensor * len(even_ranks) for tensor in tensors]
+                summed = hvd.grouped_allreduce(tensors, average=False, name=str(count),
+                                               process_set=even_set)
+            elif rank in odd_ranks:
+                tensors = [tensor.astype(dtype) for tensor in odd_rank_tensors]
+                multiplied = [tensor * len(odd_ranks) for tensor in tensors]
+                summed = hvd.grouped_allreduce(tensors, average=False, name=str(count),
+                                               process_set=odd_set)
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all([almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold)
+                for t1, t2 in zip(summed, multiplied)]), \
+                f'hvd.grouped_allreduce produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
     @unittest.skipUnless(has_gpu, "no gpu detected")
     @pytest.mark.skipif(_skip_enqueue_errors,
                         reason="Skip enqueue errors for MXNet version < 1.5.0")
@@ -648,6 +764,70 @@ class MXTests(unittest.TestCase):
                 print("comparison", hvd.rank(), tensor_dict[i] == root_dict[i])
             assert same(tensor_dict[i].asnumpy(), root_dict[i].asnumpy()), \
                 'hvd.broadcast_parameters produces incorrect broadcasted tensor'
+
+    def test_horovod_broadcast_process_sets(self):
+        """Test that the broadcast correctly broadcasts 1D, 2D, 3D tensors if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        shapes = [(), (17), (17, 17), (17, 17, 17)]
+        root_ranks = list(set_ranks)
+        for dtype, dim, root_rank in itertools.product(dtypes, dims,
+                                                       root_ranks):
+            tensor = mx.nd.ones(shapes[dim], ctx=ctx) * rank
+            root_tensor = mx.nd.ones(shapes[dim], ctx=ctx) * root_rank
+            tensor = tensor.astype(dtype)
+            root_tensor = root_tensor.astype(dtype)
+
+            broadcast_tensor = hvd.broadcast(tensor, root_rank=root_rank,
+                                             name=str(count),
+                                             process_set=this_set)
+            if rank != root_rank:
+                if same(tensor.asnumpy(), root_tensor.asnumpy()):
+                    print("broadcast", count, dtype, dim,
+                          mx.nd.max(tensor == root_tensor))
+                    print("tensor", hvd.rank(), tensor)
+                    print("root_tensor", hvd.rank(), root_tensor)
+                    print("comparison", hvd.rank(), tensor == root_tensor)
+                assert not same(tensor.asnumpy(), root_tensor.asnumpy()), \
+                    'hvd.broadcast modifies source tensor'
+            if not same(broadcast_tensor.asnumpy(), root_tensor.asnumpy()):
+                print("broadcast", count, dtype, dim)
+                print("broadcast_tensor", hvd.rank(), broadcast_tensor)
+                print("root_tensor", hvd.rank(), root_tensor)
+                print("comparison", hvd.rank(),
+                      broadcast_tensor == root_tensor)
+            assert same(broadcast_tensor.asnumpy(), root_tensor.asnumpy()), \
+                'hvd.broadcast produces incorrect broadcasted tensor'
+            count += 1
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_broadcast_error(self):
         """Test that the broadcast returns an error if any dimension besides
@@ -802,6 +982,49 @@ class MXTests(unittest.TestCase):
                 assert rank_tensor.min() == i
                 assert rank_tensor.max() == i
 
+    def test_horovod_allgather_process_sets(self):
+        """Test that the allgather correctly gathers 1D, 2D, 3D tensors if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensor = mx.ndarray.ones(shape=[17] * dim, dtype=dtype, ctx=ctx) * rank
+            gathered = hvd.allgather(tensor, process_set=this_set)
+
+            assert list(gathered.shape) == [17 * set_size] + [17] * (dim - 1)
+
+            for i in range(set_size):
+                rank_tensor = gathered[i * 17:(i + 1) * 17]
+                assert list(rank_tensor.shape) == [17] * dim, \
+                    'hvd.allgather produces incorrect gathered shape'
+                value = set_ranks[i]
+                assert rank_tensor.min() == value, 'hvd.allgather produces incorrect gathered tensor'
+                assert rank_tensor.max() == value, 'hvd.allgather produces incorrect gathered tensor'
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
+
     def test_horovod_allgather_error(self):
         """Test that the allgather returns an error if any dimension besides
         the first is different among the tensors being gathered."""
@@ -946,6 +1169,60 @@ class MXTests(unittest.TestCase):
             assert collected.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
             assert collected.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
             assert collected.size == size * (size + 1) // 2 * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+
+
+    def test_horovod_alltoall_process_sets(self):
+        """Test that the alltoall correctly distributes 1D, 2D, and 3D tensors
+        if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1,2,3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in set_ranks:
+              vals += [i] * (rank + 1)
+
+            tensor = mx.ndarray.array(vals, dtype=dtype, ctx=ctx)
+            for _ in range(dim - 1):
+              tensor = mx.ndarray.expand_dims(tensor, axis=1)
+              tensor = mx.ndarray.concat(tensor, tensor, dim=1)
+
+            splits = mx.ndarray.array([rank + 1] * set_size, dtype='int32', ctx=ctx)
+            collected, received_splits = hvd.alltoall(tensor, splits, process_set=this_set)
+
+            assert collected.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.size == sum(rk + 1 for rk in set_ranks) * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+            self.assertSequenceEqual(received_splits.asnumpy().tolist(), [rk + 1 for rk in set_ranks],
+                                     "hvd.alltoall returned incorrect received_splits")
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
 
     def test_horovod_alltoall_type_error(self):
         """Test that the alltoall returns an error if the tensor types differ
@@ -1216,6 +1493,65 @@ class MXTests(unittest.TestCase):
             expected = np.ones(tensor_size)
             err = np.linalg.norm(expected - tensor_decompressed.asnumpy())
             self.assertLess(err, 0.00000001)
+            
+    def test_optimizer_process_sets(self):
+        """Test DistributedOptimizer restricted to a process set for an entire model.
+
+        Note that this test makes the most sense when running with > 2 processes."""
+        hvd.init()
+        
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if hvd.size() == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if hvd.rank() in even_ranks:
+            this_set = even_set
+        elif hvd.rank() in odd_ranks:
+            this_set = odd_set
+            
+        ctx = self._current_context()
+        mx.random.seed(hvd.rank(), ctx=ctx)
+        
+        opt = hvd.DistributedOptimizer(mx.optimizer.Test(learning_rate=10.), process_set=even_set)
+        
+        # Identical weights tensor on each rank 
+        shape = (3, 10, 100)
+        w = mx.random.uniform(shape=shape, ctx=ctx, dtype=np.float32)
+        hvd.broadcast_(w, root_rank=0)
+
+        # Gradient tensor that differs by rank
+        g = mx.random.uniform(shape=shape, ctx=ctx, dtype=np.float32)
+        
+        # Update that is only averaged over even_set
+        if LooseVersion(mx.__version__) >= LooseVersion('2.0.0'):
+            opt.update([0], [w], [g], [opt.create_state(0, w)])
+        else:
+            opt.update(0, w, g, opt.create_state(0, w))
+
+        all_w = hvd.allgather(w, process_set=this_set)
+        if this_set == even_set:
+            my_data = w.reshape(1,-1).asnumpy()
+            for start in range(0, all_w.size, w.size):
+                gathered_data = all_w.reshape(1,-1)[:,start:start + w.size].asnumpy()
+                self.assertTrue(np.allclose(my_data, gathered_data))
+        else:
+            my_data = w.reshape(1,-1).asnumpy()
+            for start in range(0, all_w.size, w.size):
+                if start // w.size == this_set.rank():
+                    continue
+                gathered_data = all_w.reshape(1,-1)[:,start:start + w.size].asnumpy()
+                # They might randomly agree by chance, but that's extremely unlikely:
+                self.assertFalse(np.allclose(my_data, gathered_data))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
 
 if __name__ == '__main__':
