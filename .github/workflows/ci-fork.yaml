@@ -27,7 +27,7 @@ jobs:
         id: workflow-conclusion
         run: |
           curl -s "${{ github.event.workflow_run.jobs_url }}" > workflow_run_jobs.json
-          conclusion=$(jq -r '.jobs[] | select(.name | startswith("Build and Test (") | .conclusion' workflow_run_jobs.json | sort | uniq | paste -sd "," -)
+          conclusion=$(jq -r '.jobs[] | select(.name | startswith("Build and Test (")) | .conclusion' workflow_run_jobs.json | sort | uniq | paste -sd "," -)
           echo "::set-output name=build-and-test::${conclusion}"
         shell: bash
 
