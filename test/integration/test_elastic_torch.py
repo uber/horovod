@@ -39,12 +39,3 @@ class ElasticTorchTests(BaseElasticTests, unittest.TestCase):
     def test_min_hosts_timeout(self, mock_get_min_start_hosts):
         self.skipTest('This test fails due to https://github.com/horovod/horovod/issues/2030')
 
-    @mock.patch('horovod.runner.elastic.driver.DISCOVER_HOSTS_FREQUENCY_SECS', 0.01)
-    @mock.patch('horovod.runner.gloo_run._get_min_start_hosts', return_value=1)
-    def test_fault_tolerance_without_scaling(self, mock_get_min_start_hosts):
-        self.skipTest('This test fails due to https://github.com/horovod/horovod/issues/2908')
-
-    @mock.patch('horovod.runner.elastic.driver.DISCOVER_HOSTS_FREQUENCY_SECS', 0.01)
-    @mock.patch('horovod.runner.gloo_run._get_min_start_hosts', return_value=1)
-    def test_single_rank_failure(self, mock_get_min_start_hosts):
-        self.skipTest('This test fails due to https://github.com/horovod/horovod/issues/2908')
