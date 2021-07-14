@@ -24,6 +24,7 @@ import torch
 from horovod.torch.mpi_ops import allgather, broadcast_, broadcast_async_
 from horovod.torch.mpi_ops import synchronize
 from horovod.torch.mpi_ops import rank, size
+from horovod.torch.mpi_ops import ProcessSet, global_process_set
 
 
 def broadcast_parameters(params, root_rank):
@@ -187,7 +188,7 @@ def broadcast_optimizer_state(optimizer, root_rank):
         callbacks[key](p)
 
 
-def broadcast_object(obj, root_rank=0, name=None):
+def broadcast_object(obj, root_rank=0, name=None, process_set=global_process_set):
     """
     Serializes and broadcasts an object from root rank to all other processes.
     Typical usage is to broadcast the `optimizer.state_dict()`, for example:
@@ -204,6 +205,8 @@ def broadcast_object(obj, root_rank=0, name=None):
                    broadcasted to all other processes.
         name: Optional name to use during broadcast, will default to the class
               type.
+        process_set: Process set object to limit this operation to a subset of
+                     Horovod processes. Default is the global process set.
     Returns:
         The object that was broadcast from the `root_rank`.
     """
@@ -215,13 +218,13 @@ def broadcast_object(obj, root_rank=0, name=None):
         cloudpickle.dump(obj, b)
         t = torch.ByteTensor(bytearray(b.getvalue()))
         sz = torch.IntTensor([t.shape[0]])
-        broadcast_(sz, root_rank, name + '.sz')
+        broadcast_(sz, root_rank, name + '.sz', process_set)
     else:
         sz = torch.IntTensor([0])
-        broadcast_(sz, root_rank, name + '.sz')
+        broadcast_(sz, root_rank, name + '.sz', process_set)
         t = torch.ByteTensor(sz.tolist()[0])
 
-    broadcast_(t, root_rank, name + '.t')
+    broadcast_(t, root_rank, name + '.t', process_set)
 
     if rank() != root_rank:
         buf = io.BytesIO(t.numpy().tobytes())

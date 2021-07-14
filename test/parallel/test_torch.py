@@ -50,6 +50,9 @@ ccl_supported_types = set([torch.ByteTensor, torch.CharTensor, torch.ShortTensor
 # Set environment variable for dynamic timeline API test
 os.environ["HOROVOD_TIMELINE"] = "DYNAMIC"
 
+# Set environment variable to enable adding/removing process sets after initializing Horovod.
+os.environ["HOROVOD_DYNAMIC_PROCESS_SETS"] = "1"
+
 class TorchTests(unittest.TestCase):
     """
     Tests for ops in horovod.torch.
@@ -443,6 +446,61 @@ class TorchTests(unittest.TestCase):
                 break
 
             assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
+            
+    def test_horovod_allreduce_process_sets(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+        
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+            
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        
+        dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
+                     torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            even_rank_tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            odd_rank_tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            if rank in even_ranks:
+                tensor = self.cast_and_place(even_rank_tensor, dtype)
+                summed = hvd.allreduce(tensor, average=False, process_set=even_set)
+            elif rank in odd_ranks:
+                tensor = self.cast_and_place(odd_rank_tensor, dtype)
+                summed = hvd.allreduce(tensor, average=False, process_set=odd_set)
+            tensor, summed = self.convert_cpu_fp16_to_fp32(tensor, summed)
+            if rank in even_ranks:
+                multiplied = tensor * len(even_ranks)
+            elif rank in odd_ranks:
+                multiplied = tensor * len(odd_ranks)
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in [torch.IntTensor, torch.LongTensor,
+                                                      torch.cuda.IntTensor, torch.cuda.LongTensor]:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
+        
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_allreduce_error(self):
         """Test that the allreduce raises an error if different ranks try to
@@ -604,6 +662,53 @@ class TorchTests(unittest.TestCase):
                             "gradient %s differs from expected %s, "
                             "error: %s" % (grad_out, expected, str(err)))
 
+    def test_horovod_allreduce_grad_process_sets(self):
+        """Test the correctness of the allreduce gradient if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            even_rank_tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            odd_rank_tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            if rank in even_ranks:
+                tensor = self.cast_and_place(even_rank_tensor, dtype)
+                this_set = even_set
+                set_size = len(even_ranks)
+            elif rank in odd_ranks:
+                tensor = self.cast_and_place(odd_rank_tensor, dtype)
+                this_set = odd_set
+                set_size = len(odd_ranks)
+            tensor.requires_grad_()
+            summed = hvd.allreduce(tensor, average=False, process_set=this_set)
+
+            summed.backward(self.cast_and_place(torch.ones([17] * dim), dtype))
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            expected = np.ones([17] * dim) * set_size
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
     def test_horovod_grouped_allreduce(self):
         """Test that the grouped allreduce correctly sums 1D, 2D, 3D tensors."""
         hvd.init()
@@ -705,6 +810,63 @@ class TorchTests(unittest.TestCase):
             assert all([torch.allclose(t1, t2, threshold) for t1, t2 in zip(tensors, multiplied)]), \
                 'hvd.grouped_allreduce_ produces incorrect results'
 
+    def test_horovod_grouped_allreduce_process_sets(self):
+        """Test that the grouped allreduce correctly sums 1D, 2D, 3D tensors if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
+                     torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            even_rank_tensors = [torch.FloatTensor(*([17] * dim)).random_(-100, 100) for _ in range(5)]
+            odd_rank_tensors = [torch.FloatTensor(*([17] * dim)).random_(-100, 100) for _ in range(5)]
+            if rank in even_ranks:
+                tensors = [self.cast_and_place(tensor, dtype) for tensor in even_rank_tensors]
+                summed = hvd.grouped_allreduce(tensors, average=False, process_set=even_set)
+            elif rank in odd_ranks:
+                tensors = [self.cast_and_place(tensor, dtype) for tensor in odd_rank_tensors]
+                summed = hvd.grouped_allreduce(tensors, average=False, process_set=odd_set)
+            tensors, summed = zip(*[self.convert_cpu_fp16_to_fp32(t, s) for t, s in zip(tensors, summed)])
+            if rank in even_ranks:
+                multiplied = [tensor * len(even_ranks) for tensor in tensors]
+            elif rank in odd_ranks:
+                multiplied = [tensor * len(odd_ranks) for tensor in tensors]
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in [torch.IntTensor, torch.LongTensor,
+                                                      torch.cuda.IntTensor, torch.cuda.LongTensor]:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all([torch.allclose(t1, t2, threshold) for t1, t2 in zip(summed, multiplied)]), \
+                'hvd.grouped_allreduce produces incorrect results'
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
     def test_horovod_grouped_allreduce_cpu_gpu_error(self):
         """Test that the grouped allreduce raises an error if the input tensor
         list contains a mix of tensors on CPU and GPU."""
@@ -776,6 +938,57 @@ class TorchTests(unittest.TestCase):
                 self.assertLess(err, 0.00000001,
                                 "gradient %s differs from expected %s, "
                                 "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_grouped_allreduce_grad_process_sets(self):
+        """Test the correctness of the grouped allreduce gradient if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            even_rank_tensors = [torch.FloatTensor(*([17] * dim)).random_(-100, 100) for _ in range(5)]
+            odd_rank_tensors = [torch.FloatTensor(*([17] * dim)).random_(-100, 100) for _ in range(5)]
+            if rank in even_ranks:
+                tensors = [self.cast_and_place(tensor, dtype) for tensor in even_rank_tensors]
+                this_set = even_set
+                set_size = len(even_ranks)
+            elif rank in odd_ranks:
+                tensors = [self.cast_and_place(tensor, dtype) for tensor in odd_rank_tensors]
+                this_set = odd_set
+                set_size = len(odd_ranks)
+            for tensor in tensors:
+                tensor.requires_grad_()
+            summed = hvd.grouped_allreduce(tensors, average=False, process_set=this_set)
+
+            for s in summed:
+                s.backward(self.cast_and_place(torch.ones([17] * dim), dtype))
+
+            grads_out = [tensor.grad.data.cpu().numpy() for tensor in tensors]
+
+            expected = np.ones([17] * dim) * set_size
+            for grad_out in grads_out:
+                err = np.linalg.norm(expected - grad_out)
+                self.assertLess(err, 0.00000001,
+                                "gradient %s differs from expected %s, "
+                                "error: %s" % (grad_out, expected, str(err)))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_allgather(self):
         """Test that the allgather correctly gathers 1D, 2D, 3D tensors."""
@@ -889,6 +1102,58 @@ class TorchTests(unittest.TestCase):
                 assert rank_tensor.data.min() == i, 'hvd.allgather produces incorrect gathered tensor'
                 assert rank_tensor.data.max() == i, 'hvd.allgather produces incorrect gathered tensor'
 
+    def test_horovod_allgather_process_sets(self):
+        """Test that the allgather correctly gathers 1D, 2D, 3D tensors if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
+                       torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensor = torch.FloatTensor(*([17] * dim)).fill_(1).mul_(rank)
+            tensor = self.cast_and_place(tensor, dtype)
+            gathered = hvd.allgather(tensor, process_set=this_set)
+            tensor, gathered = self.convert_cpu_fp16_to_fp32(tensor, gathered)
+
+            assert list(gathered.shape) == [17 * set_size] + [17] * (dim - 1)
+
+            for i in range(set_size):
+                rank_tensor = gathered[i * 17:(i + 1) * 17]
+                assert list(rank_tensor.shape) == [17] * dim, \
+                    'hvd.allgather produces incorrect gathered shape'
+                value = set_ranks[i]
+                assert rank_tensor.data.min() == value, 'hvd.allgather produces incorrect gathered tensor'
+                assert rank_tensor.data.max() == value, 'hvd.allgather produces incorrect gathered tensor'
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
     def test_horovod_allgather_error(self):
         """Test that the allgather returns an error if any dimension besides
         the first is different among the tensors being gathered."""
@@ -979,9 +1244,9 @@ class TorchTests(unittest.TestCase):
             tensor.requires_grad_()
 
             grad_list = []
-            for r, size in enumerate(tensor_sizes):
+            for r, tensor_size in enumerate(tensor_sizes):
                 grad_list.append(self.cast_and_place(
-                    torch.ones([size] + [17] * (dim - 1)), dtype) * r)
+                    torch.ones([tensor_size] + [17] * (dim - 1)), dtype) * r)
             grad_ys = torch.cat(grad_list, dim=0)
 
             gathered = hvd.allgather(tensor)
@@ -995,6 +1260,68 @@ class TorchTests(unittest.TestCase):
             self.assertLess(err, 0.00000001,
                             "gradient %s differs from expected %s, "
                             "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_allgather_grad_process_sets(self):
+        """Test the correctness of the allgather gradient if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        if rank in even_ranks:
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            # Support tests up to MPI Size of 35
+            if size > 35:
+                break
+
+            tensor_sizes = [3, 2, 7, 4, 6, 8, 10] * 5
+            tensor_sizes = tensor_sizes[:size]
+            set_tensor_sizes = [tensor_sizes[rk] for rk in set_ranks]
+
+            tensor = torch.FloatTensor(
+                *([tensor_sizes[rank]] + [17] * (dim - 1))).fill_(1).mul_(rank)
+            tensor = self.cast_and_place(tensor, dtype)
+            tensor.requires_grad_()
+
+            grad_list = []
+            for r, tensor_size in zip(set_ranks, set_tensor_sizes):
+                grad_list.append(self.cast_and_place(
+                    torch.ones([tensor_size] + [17] * (dim - 1)), dtype) * r)
+            grad_ys = torch.cat(grad_list, dim=0)
+
+            gathered = hvd.allgather(tensor, process_set=this_set)
+            gathered.backward(grad_ys)
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            expected = np.ones(
+                [tensor_sizes[rank]] + [17] * (dim - 1)
+            ) * rank
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_broadcast(self):
         """Test that the broadcast correctly broadcasts 1D, 2D, 3D tensors."""
@@ -1062,6 +1389,61 @@ class TorchTests(unittest.TestCase):
                 'hvd.broadcast does not modify source tensor'
             assert (broadcasted_tensor == root_tensor).min() == 1, \
                 'hvd.broadcast produces incorrect broadcasted tensor'
+
+    def test_horovod_broadcast_process_sets(self):
+        """Test that the broadcast correctly broadcasts 1D, 2D, 3D tensors if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
+                       torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        root_ranks = list(set_ranks)
+        for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
+            tensor = torch.FloatTensor(*([17] * dim)).fill_(1).mul_(rank)
+            root_tensor = torch.FloatTensor(*([17] * dim)).fill_(1).mul_(root_rank)
+            tensor = self.cast_and_place(tensor, dtype)
+            root_tensor = self.cast_and_place(root_tensor, dtype)
+            broadcasted_tensor = hvd.broadcast(tensor, root_rank, process_set=this_set)
+            tensor, root_tensor, broadcasted_tensor = \
+                self.convert_cpu_fp16_to_fp32(tensor, root_tensor, broadcasted_tensor)
+            if rank != root_rank:
+                assert (tensor == root_tensor).max() == 0, \
+                    'hvd.broadcast modifies source tensor'
+            assert (broadcasted_tensor.data == root_tensor).min() == 1, \
+                'hvd.broadcast produces incorrect broadcasted tensor'
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_broadcast_error(self):
         """Test that the broadcast returns an error if any dimension besides
@@ -1178,6 +1560,59 @@ class TorchTests(unittest.TestCase):
             self.assertLess(err, 0.00000001,
                             "gradient %s differs from expected %s, "
                             "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_broadcast_grad_process_sets(self):
+        """Test the correctness of the broadcast gradient if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        root_ranks = list(set_ranks)
+        for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
+            tensor = torch.FloatTensor(*([17] * dim)).fill_(1).mul_(rank)
+            tensor = self.cast_and_place(tensor, dtype)
+            tensor.requires_grad_()
+
+            broadcasted_tensor = hvd.broadcast(tensor, root_rank, process_set=this_set)
+            broadcasted_tensor.backward(self.cast_and_place(torch.ones([17] * dim), dtype))
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            c = 1 if rank == root_rank else 0
+            expected = np.ones([17] * dim) * c
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_alltoall(self):
         """Test that the alltoall correctly distributes 1D, 2D, and 3D tensors."""
@@ -1296,6 +1731,69 @@ class TorchTests(unittest.TestCase):
             self.assertEqual(received_splits.device.type, "cuda", "received_splits should be on GPU here")
             self.assertSequenceEqual(received_splits.tolist(), [rk + 1 for rk in range(size)],
                                      "hvd.alltoall returned incorrect received_splits")
+
+    def test_horovod_alltoall_process_sets(self):
+        """Test that the alltoall correctly distributes 1D, 2D, and 3D tensors if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = self.filter_supported_types([torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
+                                              torch.IntTensor, torch.LongTensor, torch.FloatTensor,
+                                              torch.DoubleTensor, torch.HalfTensor])
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
+                       torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in set_ranks:
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            splits = torch.tensor([rank + 1] * set_size, dtype=torch.int32)
+            tensor = self.cast_and_place(tensor, dtype)
+            collected, received_splits = hvd.alltoall(tensor, splits, process_set=this_set)
+            tensor, collected = self.convert_cpu_fp16_to_fp32(tensor, collected)
+
+            assert collected.data.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.data.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.numel() == sum(rk + 1 for rk in set_ranks) * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+            self.assertSequenceEqual(received_splits.tolist(), [rk + 1 for rk in set_ranks],
+                                     "hvd.alltoall returned incorrect received_splits")
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_horovod_alltoall_type_error(self):
         """Test that the alltoall returns an error if the tensor types differ
@@ -1486,6 +1984,69 @@ class TorchTests(unittest.TestCase):
             self.assertLess(err, 0.00000001,
                             "gradient %s differs from expected %s, "
                             "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_alltoall_grad_process_sets(self):
+        """Test the correctness of the alltoall gradient if restricted to process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in set_ranks:
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            tensor = self.cast_and_place(tensor, dtype)
+            tensor.requires_grad_()
+            splits = torch.tensor([rank + 1] * set_size, dtype=torch.int32)
+            collected, received_splits = hvd.alltoall(tensor, splits, process_set=this_set)
+
+            collected.backward(self.cast_and_place(torch.ones(collected.shape), dtype))
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            expected = np.ones(tensor.shape)
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_broadcast_state(self):
         hvd.init()
@@ -1736,6 +2297,39 @@ class TorchTests(unittest.TestCase):
 
         obj = hvd.broadcast_object(obj, root_rank=0)
         self.assertDictEqual(obj, expected_obj)
+
+    def test_broadcast_object_process_sets(self):
+        hvd.init()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if hvd.size() == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if hvd.rank() in even_ranks:
+            set_ranks = even_ranks
+            this_set = even_set
+        elif hvd.rank() in odd_ranks:
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        expected_obj = {
+            'hello': 123,
+            0: [1, 2]
+        }
+        obj = expected_obj if hvd.rank() == set_ranks[0] else {}
+
+        obj = hvd.broadcast_object(obj, root_rank=set_ranks[0], process_set=this_set)
+        self.assertDictEqual(obj, expected_obj)
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
     def test_allgather_object(self):
         hvd.init()
@@ -2441,6 +3035,122 @@ class TorchTests(unittest.TestCase):
 
         for reduced, gathered in zip(allreduced_tensors, allgathered_tensors):
             assert torch.allclose(reduced, gathered.to_dense(), 1e-6)
+
+    def test_async_sparse_allreduce_process_sets(self):
+        """Test that allgather over indices and values is equivalent to allreduce if restricted to process sets."""
+        hvd.init()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if hvd.size() == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if hvd.rank() in even_ranks:
+            set_ranks = even_ranks
+            this_set = even_set
+        elif hvd.rank() in odd_ranks:
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        # Generate random tensors, then convert them to sparse
+        def random_sparse_tensor(*shape):
+            t = torch.rand(*shape)
+            t[t < 0.8] = 0
+            return t.to_sparse()
+
+        tensor_sizes = [17, 32, 81, 12, 15, 23, 22] * 5
+        tensors = [random_sparse_tensor(d0, 10) for d0 in tensor_sizes]
+        allreduced_tensors = [hvd.allreduce(t.to_dense(), process_set=this_set) for t in tensors]
+
+        handles = [hvd.sparse_allreduce_async(t, op=hvd.Average, name=str(i), process_set=this_set)
+                   for i, t in enumerate(tensors)]
+        allgathered_tensors = [handle() for handle in handles]
+
+        for reduced, gathered in zip(allreduced_tensors, allgathered_tensors):
+            assert torch.allclose(reduced, gathered.to_dense(), 1e-6)
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
+    def test_optimizer_process_sets(self):
+        """Test DistributedOptimizer restricted to a process set for an entire model.
+
+        Note that this test makes the most sense when running with > 2 processes."""
+        hvd.init()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        # This test does not apply if there is only one worker.
+        if hvd.size() == 1:
+            self.skipTest("Only one worker available")
+
+        even_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, hvd.size()) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if hvd.rank() in even_ranks:
+            this_set = even_set
+        elif hvd.rank() in odd_ranks:
+            this_set = odd_set
+
+        N, D_in, H, D_out = 64, 100, 10, 10
+        torch.manual_seed(hvd.rank())
+        x = torch.randn(N, D_in).requires_grad_()
+        y = torch.randn(N, D_out).requires_grad_()
+
+        def new_optimizer(cls, opt_params, model):
+            p = {
+                k: v for k, v in opt_params.items()
+                if k in inspect.getargspec(cls.__init__).args
+            }
+            return cls(model.parameters(), **p)
+
+        def create_model(opt_class, opt_params, process_set):
+            model = torch.nn.Sequential(
+                torch.nn.Linear(D_in, H),
+                torch.nn.ReLU(),
+                torch.nn.Linear(H, D_out),
+            )
+
+            optimizer = new_optimizer(opt_class, opt_params, model)
+            optimizer = hvd.DistributedOptimizer(
+                optimizer, named_parameters=model.named_parameters(),
+                process_set=process_set)
+
+            return model, optimizer
+
+        model, optimizer = create_model(torch.optim.SGD, dict(lr=0.2, momentum=0.9, weight_decay=0.1, centered=True),
+                                        even_set)
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+
+        y_pred = model(x)
+        loss = F.mse_loss(y_pred, y, size_average=False)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        v = model.state_dict()["2.weight"]
+        all_v = hvd.allgather(v, process_set=this_set)
+        if this_set == even_set:
+            for start in range(0, all_v.numel(), v.numel()):
+                assert torch.allclose(v.flatten(), all_v.flatten()[start:start+v.numel()])
+        else:
+            for start in range(0, all_v.numel(), v.numel()):
+                if start // v.numel() == this_set.rank():
+                    continue
+                # They might randomly agree by chance, but that's extremely unlikely:
+                assert not torch.allclose(v.flatten(), all_v.flatten()[start:start + v.numel()])
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
 
 
 
