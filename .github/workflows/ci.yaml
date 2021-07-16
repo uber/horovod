@@ -31,7 +31,9 @@ jobs:
     name: "Init Workflow"
     runs-on: ubuntu-latest
     outputs:
-      run_builds_and_tests: ${{ steps.tests.output.needed }}
+      run_at_all: github.event_name != 'schedule' || github.repository == 'horovod/horovod'
+      # if we don't get a clear 'false', we fall back to building and testing
+      run_builds_and_tests: ${{ steps.tests.output.needed }} != 'false'
 
     steps:
       - name: Checkout
@@ -69,7 +71,9 @@ jobs:
   build-and-test:
     name: "Build and Test (${{ matrix.image }})"
     needs: [init-workflow]
-    if: needs.init-workflow.outputs.run_builds_and_tests != 'false'
+    if: >
+      needs.init-workflow.outputs.run_at_all &&
+      needs.init-workflow.outputs.run_builds_and_tests
     runs-on: ubuntu-latest
 
     strategy:
@@ -283,7 +287,9 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v1
         # AWS credentials are used to authenticate against AWS ECR to pull and push test images
         # We can only authenticate when running on Horovod repo (not a fork)
-        if: github.repository == 'horovod/horovod'
+        if: >
+          github.repository == 'horovod/horovod' &&
+          ( github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository )
         continue-on-error: true
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -1727,7 +1733,9 @@ jobs:
   build-and-test-heads:
     name: "Build and Test heads (${{ matrix.image }})"
     needs: [init-workflow, build-and-test]
-    if: needs.init-workflow.outputs.run_builds_and_tests != 'false'
+    if: >
+      needs.init-workflow.outputs.run_at_all &&
+      needs.init-workflow.outputs.run_builds_and_tests
     runs-on: ubuntu-latest
 
     strategy:
@@ -1799,7 +1807,9 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v1
         # AWS credentials are used to authenticate against AWS ECR to pull and push test images
         # We can only authenticate when running on Horovod repo (not a fork)
-        if: github.repository == 'horovod/horovod'
+        if: >
+          github.repository == 'horovod/horovod' &&
+          ( github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository )
         continue-on-error: true
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -3243,7 +3253,9 @@ jobs:
   build-and-test-macos:
     name: "Build and Test macOS (${{ matrix.image }}-macos)"
     needs: [init-workflow, build-and-test]
-    if: needs.init-workflow.outputs.run_builds_and_tests != 'false'
+    if: >
+      needs.init-workflow.outputs.run_at_all &&
+      needs.init-workflow.outputs.run_builds_and_tests
     runs-on: macos-latest
 
     strategy:
@@ -3336,8 +3348,10 @@ jobs:
     needs: [init-workflow, build-and-test]
     runs-on: ubuntu-latest
     if: >
-      needs.init-workflow.outputs.run_builds_and_tests != 'false' &&
-      ( github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository )
+      github.repository == 'horovod/horovod' &&
+      needs.init-workflow.outputs.run_at_all &&
+      needs.init-workflow.outputs.run_builds_and_tests &&
+      ( github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository )
 
     steps:
       - name: Trigger Buildkite Pipeline
@@ -3368,12 +3382,14 @@ jobs:
           name: Unit Test Results - GPUs on Builtkite
           path: artifacts/Unit Test Results - GPUs on Buildkite/**/*.xml
 
-      - name: Escalate Buildkite job state
+      - name: Check Buildkite job state
         if: >
           always() &&
           steps.download.conclusion == 'success' &&
           steps.download.outputs.build-state != 'passed'
-        run: exit 1
+        run: |
+          echo "::warning::Buildkite pipeline did not pass: ${{ steps.build.outputs.url }}"
+          exit 1
 
   publish-test-results:
     name: "Publish Unit Tests Results"
@@ -3384,6 +3400,7 @@ jobs:
     # only run this job on push events or when the event does not run in a fork repository
     if: >
       ( success() || failure() ) &&
+      needs.init-workflow.outputs.run_at_all &&
       ( github.event_name == 'push' || ! github.event.head.repo.fork )
 
     steps:
@@ -3402,13 +3419,14 @@ jobs:
   docker-config:
     name: Configure docker build
     needs: [init-workflow, build-and-test, buildkite]
-    # build-and-test-cpu, build-gpu and buildkite might have been skipped (needs.init-workflow.outputs.run_builds_and_tests == 'false')
+    # build-and-test-cpu, build-gpu and buildkite might have been skipped (! needs.init-workflow.outputs.run_builds_and_tests)
     # buildkite might have been skipped (workflow runs for a fork PR)
     # we still want to build docker images in these cases
     if: >
       always() &&
-      needs.init-workflow.result == 'success' && (
-        needs.init-workflow.outputs.run_builds_and_tests == 'false' ||
+      needs.init-workflow.result == 'success' &&
+      needs.init-workflow.outputs.run_at_all && (
+        ! needs.init-workflow.outputs.run_builds_and_tests ||
         needs.build-and-test.result == 'success' &&
         ( needs.buildkite.result == 'success' || needs.buildkite.result == 'skipped' )
       )
